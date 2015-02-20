@@ -45,13 +45,13 @@ const unsigned char arp_request[60] = { 0xff, 0xff, 0xff, 0xff, 0xff,
         0x06, /* HW size */
         0x04, /* Protocol size */
         0x00, 0x01, /* Request */
-        0x01, 0x02, 0x03, 0x04, 0x05, 0x06, /* Sender MAC */
+        0xec, 0xf4, 0xbb, 0x1e, 0x47, 0x6b, /* Sender MAC */
         0x0a, 0x0a, 0x0a, 0x01, /* Sender IP - 10.10.10.1*/
         0x00, 0x00, 0x00, 0x00, 0x00, 0x00, /* Target MAC */
-        0x0a, 0x0a, 0x0a, 0x02}; /* Target IP - 10.10.10.2*/
-        //0x00, 0x00, 0x00, 0x00, 0x00, 0x00, /* Padding */
-        //0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00 };
-
+        0x0a, 0x0a, 0x0a, 0x02, /* Target IP - 10.10.10.2*/
+        0x00, 0x00, 0x00, 0x00, 0x00, 0x00, /* Padding */
+        0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00 };
+//#endif
 
 #define VHOST_CLIENT_TEST_MESSAGE        (arp_request)
 #define VHOST_CLIENT_TEST_MESSAGE_LEN    (sizeof(arp_request))
@@ -268,10 +268,18 @@ int kick(VringTable* vring_table, uint32_t v_idx)
 {
     uint64_t kick_it = 1;
     int kickfd = vring_table->vring[v_idx].kickfd;
-
+    fprintf(stdout, "kick: kickfd = %d, v_idx=%d\n",  kickfd, v_idx);
     write(kickfd, &kick_it, sizeof(kick_it));
     fsync(kickfd);
-
+    /* amakkar: till end not sure if its the kick for kickfd or kick for callfd
+    that works properly. Most probably its the kickfd only. But right now no time
+    to verify it.
+    */
+    uint64_t call_it = 1;
+    int callfd = vring_table->vring[v_idx].callfd;
+    fprintf(stdout, "kick: callfd = %d, v_idx=%d\n",  callfd, v_idx);
+    write(callfd, &call_it, sizeof(call_it));
+    fsync(callfd);
     return 0;
 }
 
@@ -1067,7 +1075,7 @@ static void handle_rdma_transport_receive(PThreadArgs *pthread_args)
     /* amakkar: wait for guest to come up and main thread to initialize the vrings
      * worse hack. Just for POC. Remove it.
      */
-    memcpy(buffer, arp_request, 42); 
+    //memcpy(buffer, arp_request, 42); 
     sleep(180);
     /* print the buffer received using rdma transfer */
     while(1)
@@ -1086,7 +1094,7 @@ static void handle_rdma_transport_receive(PThreadArgs *pthread_args)
         if (g_send_lock)
         {
             /* amakkar: to check the receive path only */
-            rdma_read_send(pthread_args, buffer, 
+            rdma_read_send(pthread_args, (void *)VHOST_CLIENT_TEST_MESSAGE, 
                             VHOST_CLIENT_TEST_MESSAGE_LEN);
         }
         else
@@ -1160,33 +1168,41 @@ static void handle_rdma_transport()
     qp_change_state_rts(transport_ctx->qp, &data);
 }
 
-int put_vring(VringTable *vring_table, uint32_t v_idx, void * buf, size_t size)
+/* rx case : send packet received from the host network device or IB device to guest */
+int put_rx_vring(VringTable *vring_table, uint32_t v_idx, void * buf, size_t size)
 {
     fprintf(stdout, "put_vring\n"); 
     struct vring_desc *desc = vring_table->vring[v_idx].desc;
+    struct vring_used * used = vring_table->vring[v_idx].used;
     struct vring_avail * avail = vring_table->vring[v_idx].avail;
     unsigned int num = vring_table->vring[v_idx].num;
     ProcessHandler * handler = &vring_table->handler;
-    fprintf(stdout, "put_vrin 1\n"); 
-
+    //guest has allocated available index for you. Use it.
     uint16_t a_idx = vring_table->vring[v_idx].last_avail_idx;
-    void *dest_buf = 0;
+    uint16_t u_idx = vring_table->vring[v_idx].last_used_idx;
+    volatile void *dest_buf = 0;
+
     struct virtio_net_hdr *hdr = 0;
     size_t hdr_len = sizeof(struct virtio_net_hdr);
-    fprintf(stdout, "put_vrin 2, v_idx=%d\n", v_idx); 
-    fprintf(stdout, "a_idx = %d, desc=%lx\n", a_idx,vring_table->vring[v_idx].desc);
-    #if 0
+
+    fprintf(stdout, "put_vring, v_idx=%d\n", v_idx); 
+    fprintf(stdout, "a_idx = %d, u_idx=%d desc[a_idx].len=%d num=%d avail->idx=%d, used->idx=%d\n",
+            a_idx,u_idx, desc[a_idx].len, num, avail->idx, used->idx);
     if(size > desc[a_idx].len)
     {
         fprintf(stdout, "put_vring wrong size size=%d, desc[a_idx].len=%d, a_idx=%d\n", size, desc[a_idx].len, a_idx);
         return -1;
     }
-    #endif
-    fprintf(stdout, "put_vring, move_available_head \n"); 
+
     /* move available head */
     vring_table->vring[v_idx].last_avail_idx = desc[a_idx].next;
-    
-    handler->map_handler = map_handler;
+    vring_table->vring[v_idx].last_used_idx = desc[u_idx].next;
+    fprintf(stdout, "put_vring, laidx=%d luidx=%d\n",
+            vring_table->vring[v_idx].last_avail_idx,
+            vring_table->vring[v_idx].last_used_idx); 
+
+
+    //handler->map_handler = map_handler;
     /* map the address */
     if (handler && handler->map_handler)
     {
@@ -1213,7 +1229,84 @@ int put_vring(VringTable *vring_table, uint32_t v_idx, void * buf, size_t size)
     /* at present support of only single buffer per packet */
     fprintf(stdout, "present support of only single buffer per packet.Ready to sync.\n");
     memcpy(dest_buf + hdr_len, buf, size);
-    dump_buffer(dest_buf, size);
+    dump_buffer(dest_buf, (size+hdr_len));
+    desc[a_idx].len = hdr_len + size;
+    fprintf(stdout, "put_vring set len=%d\n", desc[u_idx].len);
+    desc[a_idx].flags = 0;
+    desc[a_idx].next = VRING_IDX_NONE;
+    
+    /* add to available.*/
+    avail->ring[avail->idx % num] = a_idx;
+    avail->idx++;
+
+
+    /* add to available.*/
+    used->ring[used->idx % num].id = u_idx;
+    used->ring[used->idx % num].len = hdr_len + size;
+    used->idx++;
+    sync_shm(dest_buf, (size+hdr_len));
+    sync_shm((void *)&(avail), sizeof(struct vring_avail));
+    //sync_shm((void *)&(used), sizeof(struct vring_used));
+    return 0;
+}
+
+/* for tx */
+int put_vring(VringTable *vring_table, uint32_t v_idx, void * buf, size_t size)
+{
+    fprintf(stdout, "put_vring\n"); 
+    struct vring_desc *desc = vring_table->vring[v_idx].desc;
+    struct vring_avail * avail = vring_table->vring[v_idx].avail;
+    unsigned int num = vring_table->vring[v_idx].num;
+    ProcessHandler * handler = &vring_table->handler;
+    fprintf(stdout, "put_vrin 1\n"); 
+
+    uint16_t a_idx = vring_table->vring[v_idx].last_avail_idx;
+    volatile void *dest_buf = 0;
+
+    struct virtio_net_hdr *hdr = 0;
+    size_t hdr_len = sizeof(struct virtio_net_hdr);
+
+    fprintf(stdout, "put_vring, v_idx=%d\n", v_idx); 
+    fprintf(stdout, "a_idx = %d, desc=%lx desc[a_idx].len=%d\n",
+            a_idx,vring_table->vring[v_idx].desc, desc[a_idx].len);
+    if(size > desc[a_idx].len)
+    {
+        fprintf(stdout, "put_vring wrong size size=%d, desc[a_idx].len=%d, a_idx=%d\n", size, desc[a_idx].len, a_idx);
+        return -1;
+    }
+
+    fprintf(stdout, "put_vring, move_available_head \n"); 
+    /* move available head */
+    vring_table->vring[v_idx].last_avail_idx = desc[a_idx].next;
+    
+    //handler->map_handler = map_handler;
+    /* map the address */
+    if (handler && handler->map_handler)
+    {
+        /* maps the guest address corresponding to the available ring. Avail
+         * ring is maintained in the guest.
+         */
+        dest_buf = (void *)handler->map_handler(handler->context, desc[a_idx].addr);
+    }
+    else
+    {
+        dest_buf = (void *) (uintptr_t) desc[a_idx].addr;
+    }
+    
+    fprintf(stdout, "put_vring, initialize the hdr fields to all 0s \n"); 
+    /* intialize the hdr fields to all 0s */
+    hdr = dest_buf;
+    hdr->flags = 0;
+    hdr->gso_type = 0;
+    hdr->hdr_len = 0;
+    hdr->gso_size = 0;
+    hdr->csum_start = 0;
+    hdr->csum_offset = 0;
+
+    /* at present support of only single buffer per packet */
+    fprintf(stdout, "present support of only single buffer per packet.Ready to sync.\n");
+    memcpy(dest_buf + hdr_len, buf, size);
+    dump_buffer(dest_buf, (size+hdr_len));
     desc[a_idx].len = hdr_len + size;
     desc[a_idx].flags = 0;
     desc[a_idx].next = VRING_IDX_NONE;
@@ -1221,14 +1314,12 @@ int put_vring(VringTable *vring_table, uint32_t v_idx, void * buf, size_t size)
     /* add to available.*/
     avail->ring[avail->idx % num] = a_idx;
     avail->idx++;
-    fprintf(stdout, "put_vring, synching memory \n");
-    sync_shm(dest_buf, size);
+    sync_shm(dest_buf, (size+hdr_len));
     sync_shm((void *)&(avail), sizeof(struct vring_avail));
     
     fprintf(stdout, "put_vring, return 0 \n");
     return 0;
 }
-
 static int vhost_user_poll_handler(void *context)
 {
     VHostUser *vhost_user = (VHostUser *)context;
@@ -1266,6 +1357,7 @@ static int vhost_user_poll_handler(void *context)
          * and below code is exectued and packet is placed in the receive
          * Q of the client and client is kicked 
          */
+#if 0
         if(vhost_user->buffer_size)
         {
             put_vring(&vhost_user->vring_table, rx_idx, vhost_user->buffer, 
@@ -1276,6 +1368,7 @@ static int vhost_user_poll_handler(void *context)
             /*mark the buffer empty */
             vhost_user->buffer_size = 0;
         }   
+#endif
     }
     return 0;
 }

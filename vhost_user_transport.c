@@ -61,7 +61,7 @@ static int send_packet(struct VHostUser* vhost_user,void * p, size_t size)
             vhost_user->vring_table.vring[rx_idx].desc);
     if (vhost_user->vring_table.vring[rx_idx].desc)
     {
-        r = put_vring(&vhost_user->vring_table, rx_idx, (void *)p, size);
+        r = put_rx_vring(&vhost_user->vring_table, rx_idx, p, size);
         if (r != 0)
         {
             fprintf(stdout, "send_packet: put_vring failed \n");
@@ -81,9 +81,9 @@ static int send_packet(struct VHostUser* vhost_user,void * p, size_t size)
  * It then sends this received data to the VM to completem VM to VM communication.
  * Only executes in the client transport thread for receiving data using RDMA 
  */
-void rdma_read_send(PThreadArgs *pthread_args, uint8_t * buf, size_t size)
+void rdma_read_send(PThreadArgs *pthread_args, void * buf, size_t size)
 {
-    if(send_packet(pthread_args->vhost_user, (void *)buf, size) != 0)
+    if(send_packet(pthread_args->vhost_user, buf, size) != 0)
         fprintf(stdout, "Send packet failed \n");
 }
 
