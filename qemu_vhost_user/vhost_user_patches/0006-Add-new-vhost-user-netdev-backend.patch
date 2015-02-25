@@ -1,0 +1,561 @@
+From 3a2979cf16f5b62bcad600a56a35da511326903c Mon Sep 17 00:00:00 2001
+From: Antonios Motakis <a.motakis@virtualopensystems.com>
+Date: Wed, 8 Jan 2014 09:50:14 +0200
+Subject: [PATCH 6/7] Add new vhost-user netdev backend
+
+Add a new QEMU netdev backend that is intended to invoke vhost_net
+with the vhost-user backend. Also decouple virtio-net from the tap
+backend.
+
+Signed-off-by: Antonios Motakis <a.motakis@virtualopensystems.com>
+Signed-off-by: Nikolay Nikolaev <n.nikolaev@virtualopensystems.com>
+---
+ hmp-commands.hx          |   4 +-
+ hw/net/vhost_net.c       |  66 ++++++++++++++++++++++------
+ hw/net/virtio-net.c      |  42 ++++++++----------
+ hw/virtio/vhost.c        |   1 -
+ include/net/vhost-user.h |  17 ++++++++
+ include/net/vhost_net.h  |   1 +
+ net/Makefile.objs        |   2 +-
+ net/clients.h            |   3 ++
+ net/hub.c                |   1 +
+ net/net.c                |   2 +
+ net/vhost-user.c         | 111 +++++++++++++++++++++++++++++++++++++++++++++++
+ qapi-schema.json         |  18 +++++++-
+ qemu-options.hx          |   3 ++
+ 13 files changed, 227 insertions(+), 44 deletions(-)
+ create mode 100644 include/net/vhost-user.h
+ create mode 100644 net/vhost-user.c
+
+diff --git a/hmp-commands.hx b/hmp-commands.hx
+index ebe8e78..d5a3774 100644
+--- a/hmp-commands.hx
++++ b/hmp-commands.hx
+@@ -1190,7 +1190,7 @@ ETEXI
+     {
+         .name       = "host_net_add",
+         .args_type  = "device:s,opts:s?",
+-        .params     = "tap|user|socket|vde|netmap|dump [options]",
++        .params     = "tap|user|socket|vde|netmap|vhost-user|dump [options]",
+         .help       = "add host VLAN client",
+         .mhandler.cmd = net_host_device_add,
+     },
+@@ -1218,7 +1218,7 @@ ETEXI
+     {
+         .name       = "netdev_add",
+         .args_type  = "netdev:O",
+-        .params     = "[user|tap|socket|hubport|netmap],id=str[,prop=value][,...]",
++        .params     = "[user|tap|socket|hubport|netmap|vhost-user],id=str[,prop=value][,...]",
+         .help       = "add host network device",
+         .mhandler.cmd = hmp_netdev_add,
+     },
+diff --git a/hw/net/vhost_net.c b/hw/net/vhost_net.c
+index 3614e6c..e42f4d6 100644
+--- a/hw/net/vhost_net.c
++++ b/hw/net/vhost_net.c
+@@ -15,6 +15,7 @@
+ 
+ #include "net/net.h"
+ #include "net/tap.h"
++#include "net/vhost-user.h"
+ 
+ #include "hw/virtio/virtio-net.h"
+ #include "net/vhost_net.h"
+@@ -174,15 +175,20 @@ static int vhost_net_start_one(struct vhost_net *net,
+         goto fail_start;
+     }
+ 
+-    net->nc->info->poll(net->nc, false);
+-    qemu_set_fd_handler(net->backend, NULL, NULL, NULL);
+-    file.fd = net->backend;
+-    for (file.index = 0; file.index < net->dev.nvqs; ++file.index) {
+-        const VhostOps *vhost_ops = net->dev.vhost_ops;
+-        r = vhost_ops->vhost_call(&net->dev, VHOST_NET_SET_BACKEND, &file);
+-        if (r < 0) {
+-            r = -errno;
+-            goto fail;
++    if (net->nc->info->poll) {
++        net->nc->info->poll(net->nc, false);
++    }
++
++    if (net->nc->info->type == NET_CLIENT_OPTIONS_KIND_TAP) {
++        qemu_set_fd_handler(net->backend, NULL, NULL, NULL);
++        file.fd = net->backend;
++        for (file.index = 0; file.index < net->dev.nvqs; ++file.index) {
++            const VhostOps *vhost_ops = net->dev.vhost_ops;
++            r = vhost_ops->vhost_call(&net->dev, VHOST_NET_SET_BACKEND, &file);
++            if (r < 0) {
++                r = -errno;
++                goto fail;
++            }
+         }
+     }
+     return 0;
+@@ -193,7 +199,9 @@ fail:
+         int r = vhost_ops->vhost_call(&net->dev, VHOST_NET_SET_BACKEND, &file);
+         assert(r >= 0);
+     }
+-    net->nc->info->poll(net->nc, true);
++    if (net->nc->info->poll) {
++        net->nc->info->poll(net->nc, true);
++    }
+     vhost_dev_stop(&net->dev, dev);
+ fail_start:
+     vhost_dev_disable_notifiers(&net->dev, dev);
+@@ -215,7 +223,9 @@ static void vhost_net_stop_one(struct vhost_net *net,
+         int r = vhost_ops->vhost_call(&net->dev, VHOST_NET_SET_BACKEND, &file);
+         assert(r >= 0);
+     }
+-    net->nc->info->poll(net->nc, true);
++    if (net->nc->info->poll) {
++        net->nc->info->poll(net->nc, true);
++    }
+     vhost_dev_stop(&net->dev, dev);
+     vhost_dev_disable_notifiers(&net->dev, dev);
+ }
+@@ -235,7 +245,7 @@ int vhost_net_start(VirtIODevice *dev, NetClientState *ncs,
+     }
+ 
+     for (i = 0; i < total_queues; i++) {
+-        r = vhost_net_start_one(tap_get_vhost_net(ncs[i].peer), dev, i * 2);
++        r = vhost_net_start_one(get_vhost_net(ncs[i].peer), dev, i * 2);
+ 
+         if (r < 0) {
+             goto err;
+@@ -252,7 +262,7 @@ int vhost_net_start(VirtIODevice *dev, NetClientState *ncs,
+ 
+ err:
+     while (--i >= 0) {
+-        vhost_net_stop_one(tap_get_vhost_net(ncs[i].peer), dev);
++        vhost_net_stop_one(get_vhost_net(ncs[i].peer), dev);
+     }
+     return r;
+ }
+@@ -273,7 +283,7 @@ void vhost_net_stop(VirtIODevice *dev, NetClientState *ncs,
+     assert(r >= 0);
+ 
+     for (i = 0; i < total_queues; i++) {
+-        vhost_net_stop_one(tap_get_vhost_net(ncs[i].peer), dev);
++        vhost_net_stop_one(get_vhost_net(ncs[i].peer), dev);
+     }
+ }
+ 
+@@ -293,6 +303,29 @@ void vhost_net_virtqueue_mask(VHostNetState *net, VirtIODevice *dev,
+ {
+     vhost_virtqueue_mask(&net->dev, dev, idx, mask);
+ }
++
++VHostNetState *get_vhost_net(NetClientState *nc)
++{
++    VHostNetState *vhost_net = 0;
++
++    if (!nc) {
++        return 0;
++    }
++
++    switch (nc->info->type) {
++    case NET_CLIENT_OPTIONS_KIND_TAP:
++        vhost_net = tap_get_vhost_net(nc);
++        break;
++    case NET_CLIENT_OPTIONS_KIND_VHOST_USER:
++        vhost_net = vhost_user_get_vhost_net(nc);
++        break;
++    default:
++        break;
++    }
++
++    return vhost_net;
++}
++
+ #else
+ struct vhost_net *vhost_net_init(VhostNetOptions *options)
+ {
+@@ -338,4 +371,9 @@ void vhost_net_virtqueue_mask(VHostNetState *net, VirtIODevice *dev,
+                               int idx, bool mask)
+ {
+ }
++
++VHostNetState *get_vhost_net(NetClientState *nc)
++{
++    return 0;
++}
+ #endif
+diff --git a/hw/net/virtio-net.c b/hw/net/virtio-net.c
+index 3626608..d49ee82 100644
+--- a/hw/net/virtio-net.c
++++ b/hw/net/virtio-net.c
+@@ -105,14 +105,7 @@ static void virtio_net_vhost_status(VirtIONet *n, uint8_t status)
+     NetClientState *nc = qemu_get_queue(n->nic);
+     int queues = n->multiqueue ? n->max_queues : 1;
+ 
+-    if (!nc->peer) {
+-        return;
+-    }
+-    if (nc->peer->info->type != NET_CLIENT_OPTIONS_KIND_TAP) {
+-        return;
+-    }
+-
+-    if (!tap_get_vhost_net(nc->peer)) {
++    if (!get_vhost_net(nc->peer)) {
+         return;
+     }
+ 
+@@ -122,7 +115,7 @@ static void virtio_net_vhost_status(VirtIONet *n, uint8_t status)
+     }
+     if (!n->vhost_started) {
+         int r;
+-        if (!vhost_net_query(tap_get_vhost_net(nc->peer), vdev)) {
++        if (!vhost_net_query(get_vhost_net(nc->peer), vdev)) {
+             return;
+         }
+         n->vhost_started = 1;
+@@ -325,11 +318,16 @@ static void peer_test_vnet_hdr(VirtIONet *n)
+         return;
+     }
+ 
+-    if (nc->peer->info->type != NET_CLIENT_OPTIONS_KIND_TAP) {
+-        return;
++    switch (nc->peer->info->type) {
++    case NET_CLIENT_OPTIONS_KIND_TAP:
++        n->has_vnet_hdr = tap_has_vnet_hdr(nc->peer);
++        break;
++    case NET_CLIENT_OPTIONS_KIND_VHOST_USER:
++        n->has_vnet_hdr = 0;
++        break;
++    default:
++        break;
+     }
+-
+-    n->has_vnet_hdr = tap_has_vnet_hdr(nc->peer);
+ }
+ 
+ static int peer_has_vnet_hdr(VirtIONet *n)
+@@ -437,13 +435,10 @@ static uint32_t virtio_net_get_features(VirtIODevice *vdev, uint32_t features)
+         features &= ~(0x1 << VIRTIO_NET_F_HOST_UFO);
+     }
+ 
+-    if (!nc->peer || nc->peer->info->type != NET_CLIENT_OPTIONS_KIND_TAP) {
++    if (!get_vhost_net(nc->peer)) {
+         return features;
+     }
+-    if (!tap_get_vhost_net(nc->peer)) {
+-        return features;
+-    }
+-    return vhost_net_get_features(tap_get_vhost_net(nc->peer), features);
++    return vhost_net_get_features(get_vhost_net(nc->peer), features);
+ }
+ 
+ static uint32_t virtio_net_bad_features(VirtIODevice *vdev)
+@@ -507,13 +502,10 @@ static void virtio_net_set_features(VirtIODevice *vdev, uint32_t features)
+     for (i = 0;  i < n->max_queues; i++) {
+         NetClientState *nc = qemu_get_subqueue(n->nic, i);
+ 
+-        if (!nc->peer || nc->peer->info->type != NET_CLIENT_OPTIONS_KIND_TAP) {
+-            continue;
+-        }
+-        if (!tap_get_vhost_net(nc->peer)) {
++        if (!get_vhost_net(nc->peer)) {
+             continue;
+         }
+-        vhost_net_ack_features(tap_get_vhost_net(nc->peer), features);
++        vhost_net_ack_features(get_vhost_net(nc->peer), features);
+     }
+ }
+ 
+@@ -1443,7 +1435,7 @@ static bool virtio_net_guest_notifier_pending(VirtIODevice *vdev, int idx)
+     VirtIONet *n = VIRTIO_NET(vdev);
+     NetClientState *nc = qemu_get_subqueue(n->nic, vq2q(idx));
+     assert(n->vhost_started);
+-    return vhost_net_virtqueue_pending(tap_get_vhost_net(nc->peer), idx);
++    return vhost_net_virtqueue_pending(get_vhost_net(nc->peer), idx);
+ }
+ 
+ static void virtio_net_guest_notifier_mask(VirtIODevice *vdev, int idx,
+@@ -1452,7 +1444,7 @@ static void virtio_net_guest_notifier_mask(VirtIODevice *vdev, int idx,
+     VirtIONet *n = VIRTIO_NET(vdev);
+     NetClientState *nc = qemu_get_subqueue(n->nic, vq2q(idx));
+     assert(n->vhost_started);
+-    vhost_net_virtqueue_mask(tap_get_vhost_net(nc->peer),
++    vhost_net_virtqueue_mask(get_vhost_net(nc->peer),
+                              vdev, idx, mask);
+ }
+ 
+diff --git a/hw/virtio/vhost.c b/hw/virtio/vhost.c
+index a1137e1..fe622fb 100644
+--- a/hw/virtio/vhost.c
++++ b/hw/virtio/vhost.c
+@@ -14,7 +14,6 @@
+  */
+ 
+ #include "hw/virtio/vhost.h"
+-#include "hw/virtio/vhost-backend.h"
+ #include "hw/hw.h"
+ #include "qemu/atomic.h"
+ #include "qemu/range.h"
+diff --git a/include/net/vhost-user.h b/include/net/vhost-user.h
+new file mode 100644
+index 0000000..85109f6
+--- /dev/null
++++ b/include/net/vhost-user.h
+@@ -0,0 +1,17 @@
++/*
++ * vhost-user.h
++ *
++ * Copyright (c) 2013 Virtual Open Systems Sarl.
++ *
++ * This work is licensed under the terms of the GNU GPL, version 2 or later.
++ * See the COPYING file in the top-level directory.
++ *
++ */
++
++#ifndef VHOST_USER_H_
++#define VHOST_USER_H_
++
++struct vhost_net;
++struct vhost_net *vhost_user_get_vhost_net(NetClientState *nc);
++
++#endif /* VHOST_USER_H_ */
+diff --git a/include/net/vhost_net.h b/include/net/vhost_net.h
+index 1169562..abd3d0b 100644
+--- a/include/net/vhost_net.h
++++ b/include/net/vhost_net.h
+@@ -31,4 +31,5 @@ void vhost_net_ack_features(VHostNetState *net, unsigned features);
+ bool vhost_net_virtqueue_pending(VHostNetState *net, int n);
+ void vhost_net_virtqueue_mask(VHostNetState *net, VirtIODevice *dev,
+                               int idx, bool mask);
++VHostNetState *get_vhost_net(NetClientState *nc);
+ #endif
+diff --git a/net/Makefile.objs b/net/Makefile.objs
+index c25fe69..301f6b6 100644
+--- a/net/Makefile.objs
++++ b/net/Makefile.objs
+@@ -2,7 +2,7 @@ common-obj-y = net.o queue.o checksum.o util.o hub.o
+ common-obj-y += socket.o
+ common-obj-y += dump.o
+ common-obj-y += eth.o
+-common-obj-$(CONFIG_POSIX) += tap.o
++common-obj-$(CONFIG_POSIX) += tap.o vhost-user.o
+ common-obj-$(CONFIG_LINUX) += tap-linux.o
+ common-obj-$(CONFIG_WIN32) += tap-win32.o
+ common-obj-$(CONFIG_BSD) += tap-bsd.o
+diff --git a/net/clients.h b/net/clients.h
+index 7322ff5..7f3d4ae 100644
+--- a/net/clients.h
++++ b/net/clients.h
+@@ -57,4 +57,7 @@ int net_init_netmap(const NetClientOptions *opts, const char *name,
+                     NetClientState *peer);
+ #endif
+ 
++int net_init_vhost_user(const NetClientOptions *opts, const char *name,
++                        NetClientState *peer);
++
+ #endif /* QEMU_NET_CLIENTS_H */
+diff --git a/net/hub.c b/net/hub.c
+index 33a99c9..7e0f2d6 100644
+--- a/net/hub.c
++++ b/net/hub.c
+@@ -322,6 +322,7 @@ void net_hub_check_clients(void)
+             case NET_CLIENT_OPTIONS_KIND_TAP:
+             case NET_CLIENT_OPTIONS_KIND_SOCKET:
+             case NET_CLIENT_OPTIONS_KIND_VDE:
++            case NET_CLIENT_OPTIONS_KIND_VHOST_USER:
+                 has_host_dev = 1;
+                 break;
+             default:
+diff --git a/net/net.c b/net/net.c
+index 9db88cc..0f057c5 100644
+--- a/net/net.c
++++ b/net/net.c
+@@ -734,6 +734,7 @@ static int (* const net_client_init_fun[NET_CLIENT_OPTIONS_KIND_MAX])(
+         [NET_CLIENT_OPTIONS_KIND_BRIDGE]    = net_init_bridge,
+ #endif
+         [NET_CLIENT_OPTIONS_KIND_HUBPORT]   = net_init_hubport,
++        [NET_CLIENT_OPTIONS_KIND_VHOST_USER] = net_init_vhost_user,
+ };
+ 
+ 
+@@ -767,6 +768,7 @@ static int net_client_init1(const void *object, int is_netdev, Error **errp)
+         case NET_CLIENT_OPTIONS_KIND_BRIDGE:
+ #endif
+         case NET_CLIENT_OPTIONS_KIND_HUBPORT:
++        case NET_CLIENT_OPTIONS_KIND_VHOST_USER:
+             break;
+ 
+         default:
+diff --git a/net/vhost-user.c b/net/vhost-user.c
+new file mode 100644
+index 0000000..6fd5afc
+--- /dev/null
++++ b/net/vhost-user.c
+@@ -0,0 +1,111 @@
++/*
++ * vhost-user.c
++ *
++ * Copyright (c) 2013 Virtual Open Systems Sarl.
++ *
++ * This work is licensed under the terms of the GNU GPL, version 2 or later.
++ * See the COPYING file in the top-level directory.
++ *
++ */
++
++#include "clients.h"
++#include "net/vhost_net.h"
++#include "net/vhost-user.h"
++#include "qemu/error-report.h"
++
++typedef struct VhostUserState {
++    NetClientState nc;
++    VHostNetState *vhost_net;
++    char *devpath;
++} VhostUserState;
++
++VHostNetState *vhost_user_get_vhost_net(NetClientState *nc)
++{
++    VhostUserState *s = DO_UPCAST(VhostUserState, nc, nc);
++    assert(nc->info->type == NET_CLIENT_OPTIONS_KIND_VHOST_USER);
++    return s->vhost_net;
++}
++
++static int vhost_user_running(VhostUserState *s)
++{
++    return (s->vhost_net) ? 1 : 0;
++}
++
++static int vhost_user_start(VhostUserState *s)
++{
++    VhostNetOptions options;
++
++    if (vhost_user_running(s)) {
++        return 1;
++    }
++
++    options.backend_type = VHOST_BACKEND_TYPE_USER;
++    options.net_backend = &s->nc;
++    options.devpath = s->devpath;
++    options.devfd = -1;
++    options.force = 1;
++
++    s->vhost_net = vhost_net_init(&options);
++
++    return vhost_user_running(s) ? 0 : -1;
++}
++
++static void vhost_user_stop(VhostUserState *s)
++{
++    if (vhost_user_running(s)) {
++        vhost_net_cleanup(s->vhost_net);
++    }
++
++    s->vhost_net = 0;
++}
++
++static void vhost_user_cleanup(NetClientState *nc)
++{
++    VhostUserState *s = DO_UPCAST(VhostUserState, nc, nc);
++
++    vhost_user_stop(s);
++    qemu_purge_queued_packets(nc);
++}
++
++static NetClientInfo net_vhost_user_info = {
++        .type = NET_CLIENT_OPTIONS_KIND_VHOST_USER,
++        .size = sizeof(VhostUserState),
++        .cleanup = vhost_user_cleanup,
++};
++
++static int net_vhost_user_init(NetClientState *peer, const char *device,
++                          const char *name, const char *filename)
++{
++    NetClientState *nc;
++    VhostUserState *s;
++    int r;
++
++    nc = qemu_new_net_client(&net_vhost_user_info, peer, device, name);
++
++    snprintf(nc->info_str, sizeof(nc->info_str), "vhost-user to %s", filename);
++
++    s = DO_UPCAST(VhostUserState, nc, nc);
++
++    /* We don't provide a receive callback */
++    s->nc.receive_disabled = 1;
++
++    s->devpath = g_strdup(filename);
++
++    r = vhost_user_start(s);
++
++    return r;
++}
++
++int net_init_vhost_user(const NetClientOptions *opts, const char *name,
++                   NetClientState *peer)
++{
++    const char *file;
++    const NetdevVhostUserOptions *vhost_user;
++
++    assert(opts->kind == NET_CLIENT_OPTIONS_KIND_VHOST_USER);
++    vhost_user = opts->vhost_user;
++
++    file = vhost_user->file;
++
++    return net_vhost_user_init(peer, "vhost_user", name, file);
++}
+diff --git a/qapi-schema.json b/qapi-schema.json
+index c3c939c..3101287 100644
+--- a/qapi-schema.json
++++ b/qapi-schema.json
+@@ -3030,6 +3030,21 @@
+     '*devname':    'str' } }
+ 
+ ##
++# @NetdevVhostUserOptions
++#
++# Vhost-user network backend
++#
++# @file: control socket path
++#
++# Since 2.0
++##
++{ 'type': 'NetdevVhostUserOptions',
++  'data': {
++    'file': 'str' } }
++
++##
++
++##
+ # @NetClientOptions
+ #
+ # A discriminated record of network device traits.
+@@ -3047,7 +3062,8 @@
+     'dump':     'NetdevDumpOptions',
+     'bridge':   'NetdevBridgeOptions',
+     'hubport':  'NetdevHubPortOptions',
+-    'netmap':   'NetdevNetmapOptions' } }
++    'netmap':   'NetdevNetmapOptions',
++    'vhost-user': 'NetdevVhostUserOptions' } }
+ 
+ ##
+ # @NetLegacy
+diff --git a/qemu-options.hx b/qemu-options.hx
+index 0d35c9c..edf25d0 100644
+--- a/qemu-options.hx
++++ b/qemu-options.hx
+@@ -1419,6 +1419,8 @@ DEF("net", HAS_ARG, QEMU_OPTION_net,
+     "                VALE port (created on the fly) called 'name' ('nmname' is name of the \n"
+     "                netmap device, defaults to '/dev/netmap')\n"
+ #endif
++    "-net vhost-user,file=name\n"
++    "                connect to a unix domain socket implementing vhost-user backend\n"
+     "-net dump[,vlan=n][,file=f][,len=n]\n"
+     "                dump traffic on vlan 'n' to file 'f' (max n bytes per packet)\n"
+     "-net none       use it alone to have zero network devices. If no -net option\n"
+@@ -1436,6 +1438,7 @@ DEF("netdev", HAS_ARG, QEMU_OPTION_netdev,
+ #ifdef CONFIG_NETMAP
+     "netmap|"
+ #endif
++    "vhost-user|"
+     "socket|"
+     "hubport],id=str[,option][,option][,...]\n", QEMU_ARCH_ALL)
+ STEXI
+-- 
+1.9.1
+

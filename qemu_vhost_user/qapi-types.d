@@ -1,0 +1,25 @@
+qapi-types.o: qapi-types.c \
+ /home/amakkar/vhost_user/qemu_vhost_user_git/include/qapi/dealloc-visitor.h \
+ /home/amakkar/vhost_user/qemu_vhost_user_git/include/qapi/visitor.h \
+ /home/amakkar/vhost_user/qemu_vhost_user_git/include/qapi/qmp/qobject.h \
+ /home/amakkar/vhost_user/qemu_vhost_user_git/include/qapi/error.h \
+ /home/amakkar/vhost_user/qemu_vhost_user_git/include/qemu/compiler.h \
+ config-host.h qapi-types.h qapi-types.h qapi-visit.h
+
+/home/amakkar/vhost_user/qemu_vhost_user_git/include/qapi/dealloc-visitor.h:
+
+/home/amakkar/vhost_user/qemu_vhost_user_git/include/qapi/visitor.h:
+
+/home/amakkar/vhost_user/qemu_vhost_user_git/include/qapi/qmp/qobject.h:
+
+/home/amakkar/vhost_user/qemu_vhost_user_git/include/qapi/error.h:
+
+/home/amakkar/vhost_user/qemu_vhost_user_git/include/qemu/compiler.h:
+
+config-host.h:
+
+qapi-types.h:
+
+qapi-types.h:
+
+qapi-visit.h:

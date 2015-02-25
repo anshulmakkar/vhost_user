@@ -1,0 +1,224 @@
+From 3777a19ee21b9fbbefabaf884c4ba7fd8749a658 Mon Sep 17 00:00:00 2001
+From: Antonios Motakis <a.motakis@virtualopensystems.com>
+Date: Wed, 8 Jan 2014 09:50:14 +0200
+Subject: [PATCH 7/7] Add vhost-user reconnection
+
+At runtime vhost-user netdev will detect if the vhost backend is up or down.
+Upon disconnection it will set link_down accordingly and notify virtio-net.
+
+Signed-off-by: Antonios Motakis <a.motakis@virtualopensystems.com>
+Signed-off-by: Nikolay Nikolaev <n.nikolaev@virtualopensystems.com>
+---
+ hw/net/vhost_net.c                | 16 +++++++++++
+ hw/virtio/vhost-backend.c         | 16 +++++++++++
+ include/hw/virtio/vhost-backend.h |  2 ++
+ include/net/vhost_net.h           |  1 +
+ net/vhost-user.c                  | 56 +++++++++++++++++++++++++++++++++++++++
+ 5 files changed, 91 insertions(+)
+
+diff --git a/hw/net/vhost_net.c b/hw/net/vhost_net.c
+index e42f4d6..56c218e 100644
+--- a/hw/net/vhost_net.c
++++ b/hw/net/vhost_net.c
+@@ -304,6 +304,17 @@ void vhost_net_virtqueue_mask(VHostNetState *net, VirtIODevice *dev,
+     vhost_virtqueue_mask(&net->dev, dev, idx, mask);
+ }
+ 
++int vhost_net_link_status(VHostNetState *net)
++{
++    int r = 0;
++
++    if (net->dev.vhost_ops->vhost_status) {
++        r = net->dev.vhost_ops->vhost_status(&net->dev);
++    }
++
++    return r;
++}
++
+ VHostNetState *get_vhost_net(NetClientState *nc)
+ {
+     VHostNetState *vhost_net = 0;
+@@ -372,6 +383,11 @@ void vhost_net_virtqueue_mask(VHostNetState *net, VirtIODevice *dev,
+ {
+ }
+ 
++int vhost_net_link_status(VHostNetState *net)
++{
++    return 0;
++}
++
+ VHostNetState *get_vhost_net(NetClientState *nc)
+ {
+     return 0;
+diff --git a/hw/virtio/vhost-backend.c b/hw/virtio/vhost-backend.c
+index 50ea307..fcd274f 100644
+--- a/hw/virtio/vhost-backend.c
++++ b/hw/virtio/vhost-backend.c
+@@ -350,9 +350,23 @@ static int vhost_user_call(struct vhost_dev *dev, unsigned long int request,
+         }
+     }
+ 
++    /* mark the backend non operational */
++    if (result < 0) {
++        error_report("%s: Connection break detected\n", __func__);
++        vhost_user_cleanup(dev);
++        return 0;
++    }
++
+     return result;
+ }
+ 
++static int vhost_user_status(struct vhost_dev *dev)
++{
++    vhost_user_echo(dev);
++
++    return (dev->control >= 0);
++}
++
+ static int vhost_user_init(struct vhost_dev *dev, const char *devpath)
+ {
+     int fd = -1;
+@@ -432,6 +446,7 @@ static int vhost_user_cleanup(struct vhost_dev *dev)
+ static const VhostOps user_ops = {
+         .backend_type = VHOST_BACKEND_TYPE_USER,
+         .vhost_call = vhost_user_call,
++        .vhost_status = vhost_user_status,
+         .vhost_backend_init = vhost_user_init,
+         .vhost_backend_cleanup = vhost_user_cleanup
+ };
+@@ -464,6 +479,7 @@ static int vhost_kernel_cleanup(struct vhost_dev *dev)
+ static const VhostOps kernel_ops = {
+         .backend_type = VHOST_BACKEND_TYPE_KERNEL,
+         .vhost_call = vhost_kernel_call,
++        .vhost_status = 0,
+         .vhost_backend_init = vhost_kernel_init,
+         .vhost_backend_cleanup = vhost_kernel_cleanup
+ };
+diff --git a/include/hw/virtio/vhost-backend.h b/include/hw/virtio/vhost-backend.h
+index ef87ffa..f2b4a6c 100644
+--- a/include/hw/virtio/vhost-backend.h
++++ b/include/hw/virtio/vhost-backend.h
+@@ -22,12 +22,14 @@ struct vhost_dev;
+ 
+ typedef int (*vhost_call)(struct vhost_dev *dev, unsigned long int request,
+              void *arg);
++typedef int (*vhost_status)(struct vhost_dev *dev);
+ typedef int (*vhost_backend_init)(struct vhost_dev *dev, const char *devpath);
+ typedef int (*vhost_backend_cleanup)(struct vhost_dev *dev);
+ 
+ typedef struct VhostOps {
+     VhostBackendType backend_type;
+     vhost_call vhost_call;
++    vhost_status vhost_status;
+     vhost_backend_init vhost_backend_init;
+     vhost_backend_cleanup vhost_backend_cleanup;
+ } VhostOps;
+diff --git a/include/net/vhost_net.h b/include/net/vhost_net.h
+index abd3d0b..6390907 100644
+--- a/include/net/vhost_net.h
++++ b/include/net/vhost_net.h
+@@ -31,5 +31,6 @@ void vhost_net_ack_features(VHostNetState *net, unsigned features);
+ bool vhost_net_virtqueue_pending(VHostNetState *net, int n);
+ void vhost_net_virtqueue_mask(VHostNetState *net, VirtIODevice *dev,
+                               int idx, bool mask);
++int vhost_net_link_status(VHostNetState *net);
+ VHostNetState *get_vhost_net(NetClientState *nc);
+ #endif
+diff --git a/net/vhost-user.c b/net/vhost-user.c
+index 6fd5afc..56f7dd4 100644
+--- a/net/vhost-user.c
++++ b/net/vhost-user.c
+@@ -12,6 +12,7 @@
+ #include "net/vhost_net.h"
+ #include "net/vhost-user.h"
+ #include "qemu/error-report.h"
++#include "qemu/timer.h"
+ 
+ typedef struct VhostUserState {
+     NetClientState nc;
+@@ -19,6 +20,9 @@ typedef struct VhostUserState {
+     char *devpath;
+ } VhostUserState;
+ 
++static QEMUTimer *vhost_user_timer;
++#define VHOST_USER_TIMEOUT  (1*1000)
++
+ VHostNetState *vhost_user_get_vhost_net(NetClientState *nc)
+ {
+     VhostUserState *s = DO_UPCAST(VhostUserState, nc, nc);
+@@ -31,6 +35,11 @@ static int vhost_user_running(VhostUserState *s)
+     return (s->vhost_net) ? 1 : 0;
+ }
+ 
++static int vhost_user_link_status(VhostUserState *s)
++{
++    return (!s->nc.link_down) && vhost_net_link_status(s->vhost_net);
++}
++
+ static int vhost_user_start(VhostUserState *s)
+ {
+     VhostNetOptions options;
+@@ -59,6 +68,48 @@ static void vhost_user_stop(VhostUserState *s)
+     s->vhost_net = 0;
+ }
+ 
++static void vhost_user_timer_handler(void *opaque)
++{
++    VhostUserState *s = opaque;
++    int link_down = 0;
++
++    if (vhost_user_running(s)) {
++        if (!vhost_user_link_status(s)) {
++            link_down = 1;
++        }
++    } else {
++        vhost_user_start(s);
++        if (!vhost_user_running(s)) {
++            link_down = 1;
++        }
++    }
++
++    if (link_down != s->nc.link_down) {
++
++        s->nc.link_down = link_down;
++
++        if (s->nc.peer) {
++            s->nc.peer->link_down = link_down;
++        }
++
++        if (s->nc.info->link_status_changed) {
++            s->nc.info->link_status_changed(&s->nc);
++        }
++
++        if (s->nc.peer && s->nc.peer->info->link_status_changed) {
++            s->nc.peer->info->link_status_changed(s->nc.peer);
++        }
++
++        if (link_down) {
++            vhost_user_stop(s);
++        }
++    }
++
++    /* reschedule */
++    timer_mod(vhost_user_timer,
++              qemu_clock_get_ms(QEMU_CLOCK_REALTIME) + VHOST_USER_TIMEOUT);
++}
++
+ static void vhost_user_cleanup(NetClientState *nc)
+ {
+     VhostUserState *s = DO_UPCAST(VhostUserState, nc, nc);
+@@ -93,6 +144,11 @@ static int net_vhost_user_init(NetClientState *peer, const char *device,
+ 
+     r = vhost_user_start(s);
+ 
++    vhost_user_timer = timer_new_ms(QEMU_CLOCK_REALTIME,
++            vhost_user_timer_handler, s);
++    timer_mod(vhost_user_timer,
++            qemu_clock_get_ms(QEMU_CLOCK_REALTIME) + VHOST_USER_TIMEOUT);
++
+     return r;
+ }
+ 
+-- 
+1.9.1
+

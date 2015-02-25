@@ -1,0 +1,471 @@
+From db2853a0708f15525d750839bc12d93437e1245c Mon Sep 17 00:00:00 2001
+From: Antonios Motakis <a.motakis@virtualopensystems.com>
+Date: Wed, 8 Jan 2014 09:50:14 +0200
+Subject: [PATCH 2/7] Decouple vhost from kernel interface
+
+We introduce the concept of vhost-backend, which can be either vhost-kernel
+or vhost-user. The existing vhost interface to the kernel is abstracted
+behind the vhost-kernel backend.
+
+We replace all direct ioctls to the kernel with a vhost_call to the backend.
+vhost dev->control is referenced only in the vhost-backend (ioctl, open, close).
+
+Signed-off-by: Antonios Motakis <a.motakis@virtualopensystems.com>
+Signed-off-by: Nikolay Nikolaev <n.nikolaev@virtualopensystems.com>
+---
+ hw/net/vhost_net.c                | 13 +++++---
+ hw/scsi/vhost-scsi.c              | 13 +++++---
+ hw/virtio/Makefile.objs           |  2 +-
+ hw/virtio/vhost-backend.c         | 65 +++++++++++++++++++++++++++++++++++++++
+ hw/virtio/vhost.c                 | 47 +++++++++++++++-------------
+ include/hw/virtio/vhost-backend.h | 37 ++++++++++++++++++++++
+ include/hw/virtio/vhost.h         |  4 ++-
+ 7 files changed, 148 insertions(+), 33 deletions(-)
+ create mode 100644 hw/virtio/vhost-backend.c
+ create mode 100644 include/hw/virtio/vhost-backend.h
+
+diff --git a/hw/net/vhost_net.c b/hw/net/vhost_net.c
+index 006576d..4aaf0b4 100644
+--- a/hw/net/vhost_net.c
++++ b/hw/net/vhost_net.c
+@@ -27,7 +27,6 @@
+ #include <sys/socket.h>
+ #include <linux/kvm.h>
+ #include <fcntl.h>
+-#include <sys/ioctl.h>
+ #include <linux/virtio_ring.h>
+ #include <netpacket/packet.h>
+ #include <net/ethernet.h>
+@@ -113,7 +112,8 @@ struct vhost_net *vhost_net_init(NetClientState *backend, int devfd,
+     net->dev.nvqs = 2;
+     net->dev.vqs = net->vqs;
+ 
+-    r = vhost_dev_init(&net->dev, devfd, "/dev/vhost-net", force);
++    r = vhost_dev_init(&net->dev, devfd, "/dev/vhost-net",
++                       VHOST_BACKEND_TYPE_KERNEL, force);
+     if (r < 0) {
+         goto fail;
+     }
+@@ -170,7 +170,8 @@ static int vhost_net_start_one(struct vhost_net *net,
+     qemu_set_fd_handler(net->backend, NULL, NULL, NULL);
+     file.fd = net->backend;
+     for (file.index = 0; file.index < net->dev.nvqs; ++file.index) {
+-        r = ioctl(net->dev.control, VHOST_NET_SET_BACKEND, &file);
++        const VhostOps *vhost_ops = net->dev.vhost_ops;
++        r = vhost_ops->vhost_call(&net->dev, VHOST_NET_SET_BACKEND, &file);
+         if (r < 0) {
+             r = -errno;
+             goto fail;
+@@ -180,7 +181,8 @@ static int vhost_net_start_one(struct vhost_net *net,
+ fail:
+     file.fd = -1;
+     while (file.index-- > 0) {
+-        int r = ioctl(net->dev.control, VHOST_NET_SET_BACKEND, &file);
++        const VhostOps *vhost_ops = net->dev.vhost_ops;
++        int r = vhost_ops->vhost_call(&net->dev, VHOST_NET_SET_BACKEND, &file);
+         assert(r >= 0);
+     }
+     net->nc->info->poll(net->nc, true);
+@@ -201,7 +203,8 @@ static void vhost_net_stop_one(struct vhost_net *net,
+     }
+ 
+     for (file.index = 0; file.index < net->dev.nvqs; ++file.index) {
+-        int r = ioctl(net->dev.control, VHOST_NET_SET_BACKEND, &file);
++        const VhostOps *vhost_ops = net->dev.vhost_ops;
++        int r = vhost_ops->vhost_call(&net->dev, VHOST_NET_SET_BACKEND, &file);
+         assert(r >= 0);
+     }
+     net->nc->info->poll(net->nc, true);
+diff --git a/hw/scsi/vhost-scsi.c b/hw/scsi/vhost-scsi.c
+index 3983a5b..3faff65 100644
+--- a/hw/scsi/vhost-scsi.c
++++ b/hw/scsi/vhost-scsi.c
+@@ -27,12 +27,13 @@
+ static int vhost_scsi_set_endpoint(VHostSCSI *s)
+ {
+     VirtIOSCSICommon *vs = VIRTIO_SCSI_COMMON(s);
++    const VhostOps *vhost_ops = s->dev.vhost_ops;
+     struct vhost_scsi_target backend;
+     int ret;
+ 
+     memset(&backend, 0, sizeof(backend));
+     pstrcpy(backend.vhost_wwpn, sizeof(backend.vhost_wwpn), vs->conf.wwpn);
+-    ret = ioctl(s->dev.control, VHOST_SCSI_SET_ENDPOINT, &backend);
++    ret = vhost_ops->vhost_call(&s->dev, VHOST_SCSI_SET_ENDPOINT, &backend);
+     if (ret < 0) {
+         return -errno;
+     }
+@@ -43,10 +44,11 @@ static void vhost_scsi_clear_endpoint(VHostSCSI *s)
+ {
+     VirtIOSCSICommon *vs = VIRTIO_SCSI_COMMON(s);
+     struct vhost_scsi_target backend;
++    const VhostOps *vhost_ops = s->dev.vhost_ops;
+ 
+     memset(&backend, 0, sizeof(backend));
+     pstrcpy(backend.vhost_wwpn, sizeof(backend.vhost_wwpn), vs->conf.wwpn);
+-    ioctl(s->dev.control, VHOST_SCSI_CLEAR_ENDPOINT, &backend);
++    vhost_ops->vhost_call(&s->dev, VHOST_SCSI_CLEAR_ENDPOINT, &backend);
+ }
+ 
+ static int vhost_scsi_start(VHostSCSI *s)
+@@ -55,13 +57,15 @@ static int vhost_scsi_start(VHostSCSI *s)
+     VirtIODevice *vdev = VIRTIO_DEVICE(s);
+     BusState *qbus = BUS(qdev_get_parent_bus(DEVICE(vdev)));
+     VirtioBusClass *k = VIRTIO_BUS_GET_CLASS(qbus);
++    const VhostOps *vhost_ops = s->dev.vhost_ops;
+ 
+     if (!k->set_guest_notifiers) {
+         error_report("binding does not support guest notifiers");
+         return -ENOSYS;
+     }
+ 
+-    ret = ioctl(s->dev.control, VHOST_SCSI_GET_ABI_VERSION, &abi_version);
++    ret = vhost_ops->vhost_call(&s->dev,
++                                VHOST_SCSI_GET_ABI_VERSION, &abi_version);
+     if (ret < 0) {
+         return -errno;
+     }
+@@ -227,7 +231,8 @@ static void vhost_scsi_realize(DeviceState *dev, Error **errp)
+     s->dev.vqs = g_new(struct vhost_virtqueue, s->dev.nvqs);
+     s->dev.vq_index = 0;
+ 
+-    ret = vhost_dev_init(&s->dev, vhostfd, "/dev/vhost-scsi", true);
++    ret = vhost_dev_init(&s->dev, vhostfd, "/dev/vhost-scsi",
++                         VHOST_BACKEND_TYPE_KERNEL, true);
+     if (ret < 0) {
+         error_setg(errp, "vhost-scsi: vhost initialization failed: %s",
+                    strerror(-ret));
+diff --git a/hw/virtio/Makefile.objs b/hw/virtio/Makefile.objs
+index 1ba53d9..51e5bdb 100644
+--- a/hw/virtio/Makefile.objs
++++ b/hw/virtio/Makefile.objs
+@@ -5,4 +5,4 @@ common-obj-y += virtio-mmio.o
+ common-obj-$(CONFIG_VIRTIO_BLK_DATA_PLANE) += dataplane/
+ 
+ obj-y += virtio.o virtio-balloon.o 
+-obj-$(CONFIG_LINUX) += vhost.o
++obj-$(CONFIG_LINUX) += vhost.o vhost-backend.o
+diff --git a/hw/virtio/vhost-backend.c b/hw/virtio/vhost-backend.c
+new file mode 100644
+index 0000000..c0f11e4
+--- /dev/null
++++ b/hw/virtio/vhost-backend.c
+@@ -0,0 +1,65 @@
++/*
++ * vhost-backend
++ *
++ * Copyright (c) 2013 Virtual Open Systems Sarl.
++ *
++ * This work is licensed under the terms of the GNU GPL, version 2 or later.
++ * See the COPYING file in the top-level directory.
++ *
++ */
++
++#include "hw/virtio/vhost.h"
++#include "hw/virtio/vhost-backend.h"
++#include "qemu/error-report.h"
++
++#include <fcntl.h>
++#include <unistd.h>
++#include <sys/ioctl.h>
++
++static int vhost_kernel_call(struct vhost_dev *dev, unsigned long int request,
++                             void *arg)
++{
++    int fd = dev->control;
++
++    assert(dev->vhost_ops->backend_type == VHOST_BACKEND_TYPE_KERNEL);
++
++    return ioctl(fd, request, arg);
++}
++
++static int vhost_kernel_init(struct vhost_dev *dev, const char *devpath)
++{
++    assert(dev->vhost_ops->backend_type == VHOST_BACKEND_TYPE_KERNEL);
++
++    dev->control = open(devpath, O_RDWR);
++    return dev->control;
++}
++
++static int vhost_kernel_cleanup(struct vhost_dev *dev)
++{
++    assert(dev->vhost_ops->backend_type == VHOST_BACKEND_TYPE_KERNEL);
++
++    return close(dev->control);
++}
++
++static const VhostOps kernel_ops = {
++        .backend_type = VHOST_BACKEND_TYPE_KERNEL,
++        .vhost_call = vhost_kernel_call,
++        .vhost_backend_init = vhost_kernel_init,
++        .vhost_backend_cleanup = vhost_kernel_cleanup
++};
++
++int vhost_set_backend_type(struct vhost_dev *dev, VhostBackendType backend_type)
++{
++    int r = 0;
++
++    switch (backend_type) {
++    case VHOST_BACKEND_TYPE_KERNEL:
++        dev->vhost_ops = &kernel_ops;
++        break;
++    default:
++        error_report("Unknown vhost backend type\n");
++        r = -1;
++    }
++
++    return r;
++}
+diff --git a/hw/virtio/vhost.c b/hw/virtio/vhost.c
+index 9e336ad..a1137e1 100644
+--- a/hw/virtio/vhost.c
++++ b/hw/virtio/vhost.c
+@@ -13,8 +13,8 @@
+  * GNU GPL, version 2 or (at your option) any later version.
+  */
+ 
+-#include <sys/ioctl.h>
+ #include "hw/virtio/vhost.h"
++#include "hw/virtio/vhost-backend.h"
+ #include "hw/hw.h"
+ #include "qemu/atomic.h"
+ #include "qemu/range.h"
+@@ -291,7 +291,7 @@ static inline void vhost_dev_log_resize(struct vhost_dev* dev, uint64_t size)
+ 
+     log = g_malloc0(size * sizeof *log);
+     log_base = (uint64_t)(unsigned long)log;
+-    r = ioctl(dev->control, VHOST_SET_LOG_BASE, &log_base);
++    r = dev->vhost_ops->vhost_call(dev, VHOST_SET_LOG_BASE, &log_base);
+     assert(r >= 0);
+     /* Sync only the range covered by the old log */
+     if (dev->log_size) {
+@@ -460,7 +460,7 @@ static void vhost_commit(MemoryListener *listener)
+     }
+ 
+     if (!dev->log_enabled) {
+-        r = ioctl(dev->control, VHOST_SET_MEM_TABLE, dev->mem);
++        r = dev->vhost_ops->vhost_call(dev, VHOST_SET_MEM_TABLE, dev->mem);
+         assert(r >= 0);
+         dev->memory_changed = false;
+         return;
+@@ -473,7 +473,7 @@ static void vhost_commit(MemoryListener *listener)
+     if (dev->log_size < log_size) {
+         vhost_dev_log_resize(dev, log_size + VHOST_LOG_BUFFER);
+     }
+-    r = ioctl(dev->control, VHOST_SET_MEM_TABLE, dev->mem);
++    r = dev->vhost_ops->vhost_call(dev, VHOST_SET_MEM_TABLE, dev->mem);
+     assert(r >= 0);
+     /* To log less, can only decrease log size after table update. */
+     if (dev->log_size > log_size + VHOST_LOG_BUFFER) {
+@@ -541,7 +541,7 @@ static int vhost_virtqueue_set_addr(struct vhost_dev *dev,
+         .log_guest_addr = vq->used_phys,
+         .flags = enable_log ? (1 << VHOST_VRING_F_LOG) : 0,
+     };
+-    int r = ioctl(dev->control, VHOST_SET_VRING_ADDR, &addr);
++    int r = dev->vhost_ops->vhost_call(dev, VHOST_SET_VRING_ADDR, &addr);
+     if (r < 0) {
+         return -errno;
+     }
+@@ -555,7 +555,7 @@ static int vhost_dev_set_features(struct vhost_dev *dev, bool enable_log)
+     if (enable_log) {
+         features |= 0x1 << VHOST_F_LOG_ALL;
+     }
+-    r = ioctl(dev->control, VHOST_SET_FEATURES, &features);
++    r = dev->vhost_ops->vhost_call(dev, VHOST_SET_FEATURES, &features);
+     return r < 0 ? -errno : 0;
+ }
+ 
+@@ -670,13 +670,13 @@ static int vhost_virtqueue_start(struct vhost_dev *dev,
+     assert(idx >= dev->vq_index && idx < dev->vq_index + dev->nvqs);
+ 
+     vq->num = state.num = virtio_queue_get_num(vdev, idx);
+-    r = ioctl(dev->control, VHOST_SET_VRING_NUM, &state);
++    r = dev->vhost_ops->vhost_call(dev, VHOST_SET_VRING_NUM, &state);
+     if (r) {
+         return -errno;
+     }
+ 
+     state.num = virtio_queue_get_last_avail_idx(vdev, idx);
+-    r = ioctl(dev->control, VHOST_SET_VRING_BASE, &state);
++    r = dev->vhost_ops->vhost_call(dev, VHOST_SET_VRING_BASE, &state);
+     if (r) {
+         return -errno;
+     }
+@@ -718,7 +718,7 @@ static int vhost_virtqueue_start(struct vhost_dev *dev,
+     }
+ 
+     file.fd = event_notifier_get_fd(virtio_queue_get_host_notifier(vvq));
+-    r = ioctl(dev->control, VHOST_SET_VRING_KICK, &file);
++    r = dev->vhost_ops->vhost_call(dev, VHOST_SET_VRING_KICK, &file);
+     if (r) {
+         r = -errno;
+         goto fail_kick;
+@@ -756,7 +756,7 @@ static void vhost_virtqueue_stop(struct vhost_dev *dev,
+     };
+     int r;
+     assert(idx >= dev->vq_index && idx < dev->vq_index + dev->nvqs);
+-    r = ioctl(dev->control, VHOST_GET_VRING_BASE, &state);
++    r = dev->vhost_ops->vhost_call(dev, VHOST_GET_VRING_BASE, &state);
+     if (r < 0) {
+         fprintf(stderr, "vhost VQ %d ring restore failed: %d\n", idx, r);
+         fflush(stderr);
+@@ -798,7 +798,7 @@ static int vhost_virtqueue_init(struct vhost_dev *dev,
+     }
+ 
+     file.fd = event_notifier_get_fd(&vq->masked_notifier);
+-    r = ioctl(dev->control, VHOST_SET_VRING_CALL, &file);
++    r = dev->vhost_ops->vhost_call(dev, VHOST_SET_VRING_CALL, &file);
+     if (r) {
+         r = -errno;
+         goto fail_call;
+@@ -815,24 +815,28 @@ static void vhost_virtqueue_cleanup(struct vhost_virtqueue *vq)
+ }
+ 
+ int vhost_dev_init(struct vhost_dev *hdev, int devfd, const char *devpath,
+-                   bool force)
++                   VhostBackendType backend_type, bool force)
+ {
+     uint64_t features;
+     int i, r;
++
++    if (vhost_set_backend_type(hdev, backend_type) < 0) {
++        return -1;
++    }
++
+     if (devfd >= 0) {
+         hdev->control = devfd;
+     } else {
+-        hdev->control = open(devpath, O_RDWR);
+-        if (hdev->control < 0) {
++        if (hdev->vhost_ops->vhost_backend_init(hdev, devpath) < 0) {
+             return -errno;
+         }
+     }
+-    r = ioctl(hdev->control, VHOST_SET_OWNER, NULL);
++    r = hdev->vhost_ops->vhost_call(hdev, VHOST_SET_OWNER, NULL);
+     if (r < 0) {
+         goto fail;
+     }
+ 
+-    r = ioctl(hdev->control, VHOST_GET_FEATURES, &features);
++    r = hdev->vhost_ops->vhost_call(hdev, VHOST_GET_FEATURES, &features);
+     if (r < 0) {
+         goto fail;
+     }
+@@ -877,7 +881,7 @@ fail_vq:
+     }
+ fail:
+     r = -errno;
+-    close(hdev->control);
++    hdev->vhost_ops->vhost_backend_cleanup(hdev);
+     return r;
+ }
+ 
+@@ -890,7 +894,7 @@ void vhost_dev_cleanup(struct vhost_dev *hdev)
+     memory_listener_unregister(&hdev->memory_listener);
+     g_free(hdev->mem);
+     g_free(hdev->mem_sections);
+-    close(hdev->control);
++    hdev->vhost_ops->vhost_backend_cleanup(hdev);
+ }
+ 
+ bool vhost_dev_query(struct vhost_dev *hdev, VirtIODevice *vdev)
+@@ -992,7 +996,7 @@ void vhost_virtqueue_mask(struct vhost_dev *hdev, VirtIODevice *vdev, int n,
+     } else {
+         file.fd = event_notifier_get_fd(virtio_queue_get_guest_notifier(vvq));
+     }
+-    r = ioctl(hdev->control, VHOST_SET_VRING_CALL, &file);
++    r = hdev->vhost_ops->vhost_call(hdev, VHOST_SET_VRING_CALL, &file);
+     assert(r >= 0);
+ }
+ 
+@@ -1007,7 +1011,7 @@ int vhost_dev_start(struct vhost_dev *hdev, VirtIODevice *vdev)
+     if (r < 0) {
+         goto fail_features;
+     }
+-    r = ioctl(hdev->control, VHOST_SET_MEM_TABLE, hdev->mem);
++    r = hdev->vhost_ops->vhost_call(hdev, VHOST_SET_MEM_TABLE, hdev->mem);
+     if (r < 0) {
+         r = -errno;
+         goto fail_mem;
+@@ -1026,8 +1030,7 @@ int vhost_dev_start(struct vhost_dev *hdev, VirtIODevice *vdev)
+         hdev->log_size = vhost_get_log_size(hdev);
+         hdev->log = hdev->log_size ?
+             g_malloc0(hdev->log_size * sizeof *hdev->log) : NULL;
+-        r = ioctl(hdev->control, VHOST_SET_LOG_BASE,
+-                  (uint64_t)(unsigned long)hdev->log);
++        r = hdev->vhost_ops->vhost_call(hdev, VHOST_SET_LOG_BASE, hdev->log);
+         if (r < 0) {
+             r = -errno;
+             goto fail_log;
+diff --git a/include/hw/virtio/vhost-backend.h b/include/hw/virtio/vhost-backend.h
+new file mode 100644
+index 0000000..93fc55b
+--- /dev/null
++++ b/include/hw/virtio/vhost-backend.h
+@@ -0,0 +1,37 @@
++/*
++ * vhost-backend
++ *
++ * Copyright (c) 2013 Virtual Open Systems Sarl.
++ *
++ * This work is licensed under the terms of the GNU GPL, version 2 or later.
++ * See the COPYING file in the top-level directory.
++ *
++ */
++
++#ifndef VHOST_BACKEND_H_
++#define VHOST_BACKEND_H_
++
++typedef enum VhostBackendType {
++    VHOST_BACKEND_TYPE_NONE = 0,
++    VHOST_BACKEND_TYPE_KERNEL = 1,
++    VHOST_BACKEND_TYPE_MAX = 2,
++} VhostBackendType;
++
++struct vhost_dev;
++
++typedef int (*vhost_call)(struct vhost_dev *dev, unsigned long int request,
++             void *arg);
++typedef int (*vhost_backend_init)(struct vhost_dev *dev, const char *devpath);
++typedef int (*vhost_backend_cleanup)(struct vhost_dev *dev);
++
++typedef struct VhostOps {
++    VhostBackendType backend_type;
++    vhost_call vhost_call;
++    vhost_backend_init vhost_backend_init;
++    vhost_backend_cleanup vhost_backend_cleanup;
++} VhostOps;
++
++int vhost_set_backend_type(struct vhost_dev *dev,
++                           VhostBackendType backend_type);
++
++#endif /* VHOST_BACKEND_H_ */
+diff --git a/include/hw/virtio/vhost.h b/include/hw/virtio/vhost.h
+index de24746..bd650a5 100644
+--- a/include/hw/virtio/vhost.h
++++ b/include/hw/virtio/vhost.h
+@@ -2,6 +2,7 @@
+ #define VHOST_H
+ 
+ #include "hw/hw.h"
++#include "hw/virtio/vhost-backend.h"
+ #include "hw/virtio/virtio.h"
+ #include "exec/memory.h"
+ 
+@@ -48,10 +49,11 @@ struct vhost_dev {
+     bool memory_changed;
+     hwaddr mem_changed_start_addr;
+     hwaddr mem_changed_end_addr;
++    const VhostOps *vhost_ops;
+ };
+ 
+ int vhost_dev_init(struct vhost_dev *hdev, int devfd, const char *devpath,
+-                   bool force);
++                   VhostBackendType backend_type, bool force);
+ void vhost_dev_cleanup(struct vhost_dev *hdev);
+ bool vhost_dev_query(struct vhost_dev *hdev, VirtIODevice *vdev);
+ int vhost_dev_start(struct vhost_dev *hdev, VirtIODevice *vdev);
+-- 
+1.9.1
+

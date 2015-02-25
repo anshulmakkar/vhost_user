@@ -1,0 +1,707 @@
+diff --git a/hw/net/virtio-net.c b/hw/net/virtio-net.c
+index d49ee82..b6a66fc 100644
+--- a/hw/net/virtio-net.c
++++ b/hw/net/virtio-net.c
+@@ -191,7 +191,7 @@ static void rxfilter_notify(NetClientState *nc)
+ {
+     QObject *event_data;
+     VirtIONet *n = qemu_get_nic_opaque(nc);
+-
++    fprintf(stdout, "rx_filter_notify \n");
+     if (nc->rxfilter_notify_enabled) {
+         gchar *path = object_get_canonical_path(OBJECT(n->qdev));
+         if (n->netclient_name) {
+@@ -817,6 +817,7 @@ static int virtio_net_has_buffers(VirtIONetQueue *q, int bufsize)
+     if (virtio_queue_empty(q->rx_vq) ||
+         (n->mergeable_rx_bufs &&
+          !virtqueue_avail_bytes(q->rx_vq, bufsize, 0))) {
++        fprintf(stdout, "qemu: virtio-net has buffers . Set notification.\n");
+         virtio_queue_set_notification(q->rx_vq, 1);
+ 
+         /* To avoid a race condition where the guest has made some buffers
+@@ -980,6 +981,7 @@ static ssize_t virtio_net_receive(NetClientState *nc, const uint8_t *buf, size_t
+         if (i == 0) {
+             assert(offset == 0);
+             if (n->mergeable_rx_bufs) {
++                fprintf(stdout, "qemu: virtio_net_recv merg_rx_buf \n");
+                 mhdr_cnt = iov_copy(mhdr_sg, ARRAY_SIZE(mhdr_sg),
+                                     sg, elem.in_num,
+                                     offsetof(typeof(mhdr), num_buffers),
+@@ -1025,6 +1027,7 @@ static ssize_t virtio_net_receive(NetClientState *nc, const uint8_t *buf, size_t
+     }
+ 
+     virtqueue_flush(q->rx_vq, i);
++    fprintf(stdout, "qemu:net_receive: virtio_notify \n");
+     virtio_notify(vdev, q->rx_vq);
+ 
+     return size;
+diff --git a/hw/pci/msix.c b/hw/pci/msix.c
+index 3430770..addd2f4 100644
+--- a/hw/pci/msix.c
++++ b/hw/pci/msix.c
+@@ -429,7 +429,7 @@ int msix_enabled(PCIDevice *dev)
+ void msix_notify(PCIDevice *dev, unsigned vector)
+ {
+     MSIMessage msg;
+-
++    //fprintf(stdout, "qemu:msix: msix_notify \n");
+     if (vector >= dev->msix_entries_nr || !dev->msix_entry_used[vector])
+         return;
+     if (msix_is_masked(dev, vector)) {
+diff --git a/hw/pci/pci.c b/hw/pci/pci.c
+index 82c11ec..c5795ef 100644
+--- a/hw/pci/pci.c
++++ b/hw/pci/pci.c
+@@ -439,8 +439,8 @@ static int get_pci_irq_state(QEMUFile *f, void *pv, size_t size)
+     for (i = 0; i < PCI_NUM_PINS; ++i) {
+         irq_state[i] = qemu_get_be32(f);
+         if (irq_state[i] != 0x1 && irq_state[i] != 0) {
+-            fprintf(stderr, "irq state %d: must be 0 or 1.\n",
+-                    irq_state[i]);
++            //fprintf(stderr, "irq state %d: must be 0 or 1.\n",
++            //        irq_state[i]);
+             return -EINVAL;
+         }
+     }
+@@ -1185,7 +1185,7 @@ static void pci_irq_handler(void *opaque, int irq_num, int level)
+ {
+     PCIDevice *pci_dev = opaque;
+     int change;
+-
++    //fprintf(stdout, "qemu,pci.c: pci_irq_handler \n");
+     change = level - pci_irq_state(pci_dev, irq_num);
+     if (!change)
+         return;
+@@ -1212,6 +1212,7 @@ qemu_irq pci_allocate_irq(PCIDevice *pci_dev)
+ void pci_set_irq(PCIDevice *pci_dev, int level)
+ {
+     int intx = pci_intx(pci_dev);
++    //fprintf(stdout, "qemu:pci.c: pci_set_irq \n");
+     pci_irq_handler(pci_dev, intx, level);
+ }
+ 
+diff --git a/hw/virtio/vhost-backend.c b/hw/virtio/vhost-backend.c
+index fcd274f..b69deee 100644
+--- a/hw/virtio/vhost-backend.c
++++ b/hw/virtio/vhost-backend.c
+@@ -80,7 +80,7 @@ typedef struct VhostUserMsg {
+ 
+ /* The version of the protocol we support */
+ #define VHOST_USER_VERSION    (0x1)
+-
++void dump_mem(uint8 *address, int length);
+ static unsigned long int ioctl_to_vhost_user_request[VHOST_USER_MAX] = {
+     -1, /* VHOST_USER_NONE */
+     VHOST_GET_FEATURES, /* VHOST_USER_GET_FEATURES */
+@@ -103,6 +103,50 @@ static unsigned long int ioctl_to_vhost_user_request[VHOST_USER_MAX] = {
+ 
+ static int vhost_user_cleanup(struct vhost_dev *dev);
+ 
++
++void dump_mem(uint8 *address, int length) 
++{
++    int i = 0; //used to keep track of line lengths
++    //char *line = (char*)address; //used to print char version of data
++    uint8_t *line = (uint8_t*)address; //used to print char version of data
++    unsigned char ch; // also used to print char version of data
++    fprintf(stdout, "\n");
++    fprintf(stdout, "\nx%" PRIXPTR " :", (uintptr_t)address); 
++    //fprintf(stdout, "%08X | ", (uint32_t)address); //Print the address we are pulling from
++    //fprintf(stdout, "%p | ", (uint8_t*)address); //Print the address we are pulling from
++    while (length-- > 0) 
++    {
++        fprintf(stdout, "%02X ", (unsigned char)*address++); //Print each char
++        if (!(++i % 16) || (length == 0 && i % 16)) 
++        { //If we come to the end of a line...
++            //If this is the last line, print some fillers.
++            if (length == 0)
++            {
++                while (i++ % 16) 
++                { 
++                    fprintf(stdout, "__ "); 
++                }     
++            }
++            fprintf(stdout, "| ");
++            while ((uint8_t*)line < (uint8_t*)address) 
++            {
++                // Print the character version
++                ch = *line++;
++                fprintf(stdout, "%c", (ch < 33 || ch == 255) ? 0x2E : ch);
++            }
++            // If we are not on the last line, prefix the next line with the address.
++            if (length > 0) 
++            {
++                //fprintf(stdout, "\n%08X | ", (intptr_t)address); 
++                fprintf(stdout, "\nx%" PRIXPTR " :", (uintptr_t)address); 
++                //fprintf(stdout, "\n%p | ", (uint8_t*)address); 
++            }
++        }
++    }
++    puts("");
++}
++
++
+ static VhostUserRequest vhost_user_request_translate(unsigned long int request)
+ {
+     VhostUserRequest idx;
+@@ -115,7 +159,7 @@ static VhostUserRequest vhost_user_request_translate(unsigned long int request)
+ 
+     return (idx == VHOST_USER_MAX) ? VHOST_USER_NONE : idx;
+ }
+-
++#if 0
+ static int vhost_user_recv(int fd, VhostUserMsg *msg)
+ {
+     ssize_t r;
+@@ -140,6 +184,7 @@ static int vhost_user_recv(int fd, VhostUserMsg *msg)
+ 
+     return (r < 0) ? -1 : 0;
+ }
++#endif
+ 
+ static int vhost_user_send_fds(int fd, const VhostUserMsg *msg, int *fds,
+         size_t fd_num)
+@@ -163,8 +208,10 @@ static int vhost_user_send_fds(int fd, const VhostUserMsg *msg, int *fds,
+     msgh.msg_iov = iov;
+     msgh.msg_iovlen = 1;
+ 
++    //fprintf(stderr, "qemu: vhost_user_send_fds \n");
+     if (fd_num) {
+         msgh.msg_control = control;
++        fprintf(stderr, "--------------------------\n");
+         msgh.msg_controllen = sizeof(control);
+ 
+         cmsg = CMSG_FIRSTHDR(&msgh);
+@@ -177,9 +224,13 @@ static int vhost_user_send_fds(int fd, const VhostUserMsg *msg, int *fds,
+         msgh.msg_control = 0;
+         msgh.msg_controllen = 0;
+     }
+-
++    
++    //dump_mem((uint8_t*)msg, sizeof(VhostUserMsg));
+     do {
++        //fprintf(stderr, "qemu: send msg fd=%d and msg = 0x%x sizeof msg= %lu\n",
++        //        fd, msg->request, sizeof(VhostUserMsg));
+         r = sendmsg(fd, &msgh, 0);
++        fprintf(stderr, "--------------------------\n");
+     } while (r < 0 && errno == EINTR);
+ 
+     if (r < 0) {
+@@ -205,22 +256,22 @@ static int vhost_user_echo(struct vhost_dev *dev)
+     msg.request = VHOST_USER_ECHO;
+     msg.flags = VHOST_USER_VERSION;
+     msg.size = 0;
+-
++    //fprintf(stdout, "qemu: vhost_user_echo \n");
+     if (vhost_user_send_fds(fd, &msg, 0, 0) < 0) {
+-        error_report("ECHO failed\n");
++        error_report("ECHO send failed\n");
+         return -1;
+     }
+-
++#if 0
+     if (vhost_user_recv(fd, &msg) < 0) {
+-        error_report("ECHO failed\n");
++        error_report("ECHO revb failed\n");
+         return -1;
+     }
+-
+     if ((msg.flags & VHOST_USER_REPLY_MASK) == 0 ||
+         (msg.flags & VHOST_USER_VERSION_MASK) != VHOST_USER_VERSION) {
+-        error_report("ECHO failed\n");
++        error_report("ECHO reply failed\n");
+         return -1;
+     }
++#endif
+ 
+     return 0;
+ }
+@@ -231,7 +282,8 @@ static int vhost_user_call(struct vhost_dev *dev, unsigned long int request,
+     int fd = dev->control;
+     VhostUserMsg msg;
+     RAMBlock *block = 0;
+-    int result = 0, need_reply = 0;
++    int result = 0;
++    // need_reply = 0;
+     int fds[VHOST_MEMORY_MAX_NREGIONS];
+     size_t fd_num = 0;
+ 
+@@ -244,24 +296,28 @@ static int vhost_user_call(struct vhost_dev *dev, unsigned long int request,
+     msg.request = vhost_user_request_translate(request);
+     msg.flags = VHOST_USER_VERSION;
+     msg.size = 0;
+-
++    fprintf(stderr, "Sending request = 0x%x\n", msg.request);
+     switch (request) {
+     case VHOST_GET_FEATURES:
+     case VHOST_GET_VRING_BASE:
+-        need_reply = 1;
++        fprintf(stderr, "qemu: GET_VRING_BASE, GET_FEATURES\n");
++        //need_reply = 1;
+         break;
+ 
+     case VHOST_SET_FEATURES:
+     case VHOST_SET_LOG_BASE:
++        fprintf(stderr, "qemu: SET_LOG_BASE, SET_FEATURE\n");
+         msg.u64 = *((__u64 *) arg);
+         msg.size = MEMB_SIZE(VhostUserMsg, u64);
+         break;
+ 
+     case VHOST_SET_OWNER:
+     case VHOST_RESET_OWNER:
++        fprintf(stderr, "qemu:  VHOST_SET_RESET_OWNER \n");
+         break;
+ 
+     case VHOST_SET_MEM_TABLE:
++        fprintf(stderr, "qemu: SET_MEM_TABLE\n");
+         QTAILQ_FOREACH(block, &ram_list.blocks, next)
+         {
+             if (block->fd > 0) {
+@@ -269,6 +325,7 @@ static int vhost_user_call(struct vhost_dev *dev, unsigned long int request,
+                 msg.memory.regions[fd_num].memory_size = block->length;
+                 msg.memory.regions[fd_num].guest_phys_addr = block->offset;
+                 fds[fd_num++] = block->fd;
++                fprintf(stdout,"fd_num = 0x%lx, block->fd=0x%x \n", fd_num, block->fd); 
+             }
+         }
+ 
+@@ -283,44 +340,72 @@ static int vhost_user_call(struct vhost_dev *dev, unsigned long int request,
+         msg.size = MEMB_SIZE(VhostUserMemory, nregions);
+         msg.size += MEMB_SIZE(VhostUserMemory, padding);
+         msg.size += fd_num*sizeof(VhostUserMemoryRegion);
+-
++        fprintf(stdout, "send nregions=%d size of req=%lu\n", msg.memory.nregions,
++            sizeof(VhostUserMsg));
++        //dump_mem((uint8_t*)&msg, sizeof(VhostUserMsg));
+         break;
+ 
+     case VHOST_SET_LOG_FD:
++        fprintf(stderr, "VHOST_SET_LOG_FD \n");
+         msg.fd = *((int *) arg);
+         msg.size = MEMB_SIZE(VhostUserMsg, fd);
+         break;
+ 
+     case VHOST_SET_VRING_NUM:
+     case VHOST_SET_VRING_BASE:
++        fprintf(stderr, "qemu: SET_VRING_NAME, VRING_BASE\n");
+         memcpy(&msg.state, arg, sizeof(struct vhost_vring_state));
+         msg.size = MEMB_SIZE(VhostUserMsg, state);
+         break;
+ 
+     case VHOST_SET_VRING_ADDR:
++        //fprintf(stderr, "qemu: SET_VRING_ADDR\n");
+         memcpy(&msg.addr, arg, sizeof(struct vhost_vring_addr));
+         msg.size = MEMB_SIZE(VhostUserMsg, addr);
++#if 0
++        fprintf(stdout, "VHOST_USER_SET_VRING_ADDR addr:\n\tidx = %d\n\t \
++                flags = 0x%x\n \
++                \tdua = %llx\n \
++                \tuua = %llx\n \
++                \taua = %llx\n \
++                \tlga = %llx\n", msg.addr.index, msg.addr.flags,
++                msg.addr.desc_user_addr, msg.addr.used_user_addr,
++                msg.addr.avail_user_addr, msg.addr.log_guest_addr);
++#endif
+         break;
+ 
+     case VHOST_SET_VRING_KICK:
+     case VHOST_SET_VRING_CALL:
+     case VHOST_SET_VRING_ERR:
+     case VHOST_NET_SET_BACKEND:
++        fprintf(stderr, "qemu: VRING KICK, CALL, ERR,  SET_BACKEND\n");
+         memcpy(&msg.file, arg, sizeof(struct vhost_vring_file));
++        if (request == VHOST_SET_VRING_KICK)
++        {
++            fprintf(stdout, "qemu: vring_kick: fd=%d,idx=%d\n", 
++                            msg.file.fd, msg.file.index);
++        }
++        if (request == VHOST_SET_VRING_CALL)
++        {
++            fprintf(stdout, "qemu: vring_call: fd=%d,idx=%d\n", 
++                            msg.file.fd, msg.file.index);
++        }
++
+         msg.size = MEMB_SIZE(VhostUserMsg, file);
+         if (msg.file.fd > 0) {
+             fds[0] = msg.file.fd;
+             fd_num = 1;
+         }
++        //dump_mem((uint8_t *)&msg, sizeof(VhostUserMsg));
+         break;
+     default:
+-        error_report("vhost-user trying to send unhandled ioctl\n");
++        fprintf(stderr, "vhost-user trying to send unhandled ioctl\n");
+         return -1;
+         break;
+     }
+-
++    fprintf(stderr, "qemu: calling send_fds \n");
+     result = vhost_user_send_fds(fd, &msg, fds, fd_num);
+-
++   #if 0 
+     if (!result && need_reply) {
+         result = vhost_user_recv(fd, &msg);
+ 
+@@ -334,14 +419,14 @@ static int vhost_user_call(struct vhost_dev *dev, unsigned long int request,
+             switch (request) {
+             case VHOST_GET_FEATURES:
+                 if (msg.size != MEMB_SIZE(VhostUserMsg, u64)) {
+-                    error_report("Received bad msg.\n");
++                    error_report("Received bad msg. GET_FEAT\n");
+                     return -1;
+                 }
+                 *((__u64 *) arg) = msg.u64;
+                 break;
+             case VHOST_GET_VRING_BASE:
+                 if (msg.size != MEMB_SIZE(VhostUserMsg, state)) {
+-                    error_report("Received bad msg.\n");
++                    error_report("Received bad msg. SET_VRING_BASE\n");
+                     return -1;
+                 }
+                 memcpy(arg, &msg.state, sizeof(struct vhost_vring_state));
+@@ -349,6 +434,7 @@ static int vhost_user_call(struct vhost_dev *dev, unsigned long int request,
+             }
+         }
+     }
++#endif
+ 
+     /* mark the backend non operational */
+     if (result < 0) {
+@@ -362,6 +448,7 @@ static int vhost_user_call(struct vhost_dev *dev, unsigned long int request,
+ 
+ static int vhost_user_status(struct vhost_dev *dev)
+ {
++    //fprintf(stderr, "qemu: check status. vhost_user_echo\n");
+     vhost_user_echo(dev);
+ 
+     return (dev->control >= 0);
+@@ -375,7 +462,7 @@ static int vhost_user_init(struct vhost_dev *dev, const char *devpath)
+     size_t len;
+ 
+     assert(dev->vhost_ops->backend_type == VHOST_BACKEND_TYPE_USER);
+-
++    fprintf(stderr, "qemu: vhost_user_init \n");
+     /* Create the socket */
+     fd = qemu_socket(AF_UNIX, SOCK_STREAM, 0);
+     if (fd == -1) {
+@@ -417,6 +504,7 @@ static int vhost_user_init(struct vhost_dev *dev, const char *devpath)
+     dev->control = fd;
+ 
+     if (vhost_user_echo(dev) < 0) {
++        fprintf(stderr, "vhost_user_echo failed. exit \n");
+         dev->control = -1;
+         goto fail;
+     }
+@@ -493,6 +581,7 @@ int vhost_set_backend_type(struct vhost_dev *dev, VhostBackendType backend_type)
+         dev->vhost_ops = &kernel_ops;
+         break;
+     case VHOST_BACKEND_TYPE_USER:
++        fprintf(stderr, "qemu: set backend type user \n");
+         dev->vhost_ops = &user_ops;
+         break;
+     default:
+diff --git a/hw/virtio/vhost.c b/hw/virtio/vhost.c
+index fe622fb..1d7eeb2 100644
+--- a/hw/virtio/vhost.c
++++ b/hw/virtio/vhost.c
+@@ -459,6 +459,7 @@ static void vhost_commit(MemoryListener *listener)
+     }
+ 
+     if (!dev->log_enabled) {
++        fprintf(stdout, "qemu: vhost_commit, vhost_call VHOST_SEM_MEM_TABLE \n");
+         r = dev->vhost_ops->vhost_call(dev, VHOST_SET_MEM_TABLE, dev->mem);
+         assert(r >= 0);
+         dev->memory_changed = false;
+@@ -472,6 +473,7 @@ static void vhost_commit(MemoryListener *listener)
+     if (dev->log_size < log_size) {
+         vhost_dev_log_resize(dev, log_size + VHOST_LOG_BUFFER);
+     }
++   fprintf(stdout, "qemu: vhost_commit, vhost_call 1VHOST_SEM_MEM_TABLE \n");
+     r = dev->vhost_ops->vhost_call(dev, VHOST_SET_MEM_TABLE, dev->mem);
+     assert(r >= 0);
+     /* To log less, can only decrease log size after table update. */
+@@ -540,6 +542,10 @@ static int vhost_virtqueue_set_addr(struct vhost_dev *dev,
+         .log_guest_addr = vq->used_phys,
+         .flags = enable_log ? (1 << VHOST_VRING_F_LOG) : 0,
+     };
++    fprintf(stdout, "qemu:vhost_setaddr,vhost_call VHOST_SET_VRING_ADDR \
++                     idx = %u desc addr = %llx,avail_addr=%llx,used_addr=%llx\n",
++                     addr.index, addr.desc_user_addr, addr.avail_user_addr, 
++                     addr.used_user_addr);
+     int r = dev->vhost_ops->vhost_call(dev, VHOST_SET_VRING_ADDR, &addr);
+     if (r < 0) {
+         return -errno;
+@@ -717,6 +723,10 @@ static int vhost_virtqueue_start(struct vhost_dev *dev,
+     }
+ 
+     file.fd = event_notifier_get_fd(virtio_queue_get_host_notifier(vvq));
++    fprintf(stdout, "qemu: vq_start VRING_KICK idx=%d rfd=%d wfd=%d \n",
++            idx, (virtio_queue_get_host_notifier(vvq))->rfd, 
++            (virtio_queue_get_host_notifier(vvq))->wfd
++            );
+     r = dev->vhost_ops->vhost_call(dev, VHOST_SET_VRING_KICK, &file);
+     if (r) {
+         r = -errno;
+@@ -797,6 +807,7 @@ static int vhost_virtqueue_init(struct vhost_dev *dev,
+     }
+ 
+     file.fd = event_notifier_get_fd(&vq->masked_notifier);
++    fprintf(stdout, "qemu: vq init  VHOST_SET_VRING_CALL fd = %d\n", file.fd);
+     r = dev->vhost_ops->vhost_call(dev, VHOST_SET_VRING_CALL, &file);
+     if (r) {
+         r = -errno;
+@@ -916,6 +927,7 @@ int vhost_dev_enable_notifiers(struct vhost_dev *hdev, VirtIODevice *vdev)
+     VirtioBusState *vbus = VIRTIO_BUS(qbus);
+     VirtioBusClass *k = VIRTIO_BUS_GET_CLASS(vbus);
+     int i, r;
++    fprintf(stdout, "qemu: enable_notifiers \n");
+     if (!k->set_host_notifier) {
+         fprintf(stderr, "binding does not support host notifiers\n");
+         r = -ENOSYS;
+@@ -955,7 +967,7 @@ void vhost_dev_disable_notifiers(struct vhost_dev *hdev, VirtIODevice *vdev)
+     VirtioBusState *vbus = VIRTIO_BUS(qbus);
+     VirtioBusClass *k = VIRTIO_BUS_GET_CLASS(vbus);
+     int i, r;
+-
++    fprintf(stdout, "qemu: disable_notifiers \n");
+     for (i = 0; i < hdev->nvqs; ++i) {
+         r = k->set_host_notifier(qbus->parent, hdev->vq_index + i, false);
+         if (r < 0) {
+@@ -992,8 +1004,12 @@ void vhost_virtqueue_mask(struct vhost_dev *hdev, VirtIODevice *vdev, int n,
+     };
+     if (mask) {
+         file.fd = event_notifier_get_fd(&hdev->vqs[index].masked_notifier);
++        fprintf(stdout, "qemu: vhost_call vq_mask VHOST_SET_VRING_CALL fd=%d \n",
++                file.fd);
+     } else {
+         file.fd = event_notifier_get_fd(virtio_queue_get_guest_notifier(vvq));
++        fprintf(stdout, "qemu: vhost_call vq_unmask  VHOST_SET_VRING_CALL fd=%d \n",
++                file.fd);
+     }
+     r = hdev->vhost_ops->vhost_call(hdev, VHOST_SET_VRING_CALL, &file);
+     assert(r >= 0);
+@@ -1010,12 +1026,14 @@ int vhost_dev_start(struct vhost_dev *hdev, VirtIODevice *vdev)
+     if (r < 0) {
+         goto fail_features;
+     }
++    fprintf(stdout, "qemu: vhost_call dev_start  VHOST_SET_MEM_TAB \n");
+     r = hdev->vhost_ops->vhost_call(hdev, VHOST_SET_MEM_TABLE, hdev->mem);
+     if (r < 0) {
+         r = -errno;
+         goto fail_mem;
+     }
+     for (i = 0; i < hdev->nvqs; ++i) {
++        fprintf(stdout, "qemu: vhost_Dev_start nvqs = %d\n", hdev->nvqs);
+         r = vhost_virtqueue_start(hdev,
+                                   vdev,
+                                   hdev->vqs + i,
+diff --git a/hw/virtio/virtio-mmio.c b/hw/virtio/virtio-mmio.c
+index 8829eb0..4d42ad1 100644
+--- a/hw/virtio/virtio-mmio.c
++++ b/hw/virtio/virtio-mmio.c
+@@ -306,6 +306,7 @@ static void virtio_mmio_update_irq(DeviceState *opaque, uint16_t vector)
+     }
+     level = (vdev->isr != 0);
+     DPRINTF("virtio_mmio setting IRQ %d\n", level);
++    //fprintf(stdout, "virtio_mmio setting IRQ %d\n", level);
+     qemu_set_irq(proxy->irq, level);
+ }
+ 
+diff --git a/hw/virtio/virtio-pci.c b/hw/virtio/virtio-pci.c
+index 30c9f2b..ba3bff6 100644
+--- a/hw/virtio/virtio-pci.c
++++ b/hw/virtio/virtio-pci.c
+@@ -113,7 +113,7 @@ static inline VirtIOPCIProxy *to_virtio_pci_proxy_fast(DeviceState *d)
+ static void virtio_pci_notify(DeviceState *d, uint16_t vector)
+ {
+     VirtIOPCIProxy *proxy = to_virtio_pci_proxy_fast(d);
+-
++    //fprintf(stdout, "qemu: virtio-pci.c: virtio_pci_not\n");
+     if (msix_enabled(&proxy->pci_dev))
+         msix_notify(&proxy->pci_dev, vector);
+     else {
+diff --git a/hw/virtio/virtio.c b/hw/virtio/virtio.c
+index 144b9ca..fc5a480 100644
+--- a/hw/virtio/virtio.c
++++ b/hw/virtio/virtio.c
+@@ -199,6 +199,7 @@ static inline void vring_used_flags_unset_bit(VirtQueue *vq, int mask)
+ static inline void vring_avail_event(VirtQueue *vq, uint16_t val)
+ {
+     hwaddr pa;
++    //fprintf(stdout, "virtio.c: avail_event \n");
+     if (!vq->notification) {
+         return;
+     }
+@@ -237,7 +238,7 @@ void virtqueue_fill(VirtQueue *vq, const VirtQueueElement *elem,
+ {
+     unsigned int offset;
+     int i;
+-
++    //fprintf(stdout, "virtio.c : virtq_fill \n");
+     trace_virtqueue_fill(vq, elem, len, idx);
+ 
+     offset = 0;
+@@ -314,6 +315,7 @@ static unsigned int virtqueue_get_head(VirtQueue *vq, unsigned int idx)
+     /* If their number is silly, that's a fatal mistake. */
+     if (head >= vq->vring.num) {
+         error_report("Guest says index %u is available", head);
++        //fprintf(stdout, "Guest says index %u is available", head);
+         exit(1);
+     }
+ 
+@@ -452,12 +454,14 @@ int virtqueue_pop(VirtQueue *vq, VirtQueueElement *elem)
+ 
+     i = head = virtqueue_get_head(vq, vq->last_avail_idx++);
+     if (vq->vdev->guest_features & (1 << VIRTIO_RING_F_EVENT_IDX)) {
++        fprintf(stdout, "qemu: virtq_pop avail_event \n");
+         vring_avail_event(vq, vring_avail_idx(vq));
+     }
+ 
+     if (vring_desc_flags(desc_pa, i) & VRING_DESC_F_INDIRECT) {
+         if (vring_desc_len(desc_pa, i) % sizeof(VRingDesc)) {
+             error_report("Invalid size for indirect buffer table");
++            //fprintf(stdout, "Invalid size for indirect buffer table");
+             exit(1);
+         }
+ 
+@@ -474,6 +478,7 @@ int virtqueue_pop(VirtQueue *vq, VirtQueueElement *elem)
+         if (vring_desc_flags(desc_pa, i) & VRING_DESC_F_WRITE) {
+             if (elem->in_num >= ARRAY_SIZE(elem->in_sg)) {
+                 error_report("Too many write descriptors in indirect table");
++                //fprintf(stdout, "Too many write descriptors in indirect table");
+                 exit(1);
+             }
+             elem->in_addr[elem->in_num] = vring_desc_addr(desc_pa, i);
+@@ -481,6 +486,7 @@ int virtqueue_pop(VirtQueue *vq, VirtQueueElement *elem)
+         } else {
+             if (elem->out_num >= ARRAY_SIZE(elem->out_sg)) {
+                 error_report("Too many read descriptors in indirect table");
++                //fprintf(stdout, "Too many read descriptors in indirect table");
+                 exit(1);
+             }
+             elem->out_addr[elem->out_num] = vring_desc_addr(desc_pa, i);
+@@ -492,6 +498,7 @@ int virtqueue_pop(VirtQueue *vq, VirtQueueElement *elem)
+         /* If we've got too many, that implies a descriptor loop. */
+         if ((elem->in_num + elem->out_num) > max) {
+             error_report("Looped descriptor");
++            //fprintf(stdout, "Looped descriptor");
+             exit(1);
+         }
+     } while ((i = virtqueue_next_desc(desc_pa, i, max)) != max);
+@@ -513,7 +520,7 @@ static void virtio_notify_vector(VirtIODevice *vdev, uint16_t vector)
+ {
+     BusState *qbus = qdev_get_parent_bus(DEVICE(vdev));
+     VirtioBusClass *k = VIRTIO_BUS_GET_CLASS(qbus);
+-
++    //fprintf(stdout, "qemu:virtio.c: virtio_not_vector \n");
+     if (k->notify) {
+         k->notify(qbus->parent, vector);
+     }
+@@ -714,6 +721,7 @@ void virtio_queue_set_align(VirtIODevice *vdev, int n, int align)
+ 
+ void virtio_queue_notify_vq(VirtQueue *vq)
+ {
++    //fprintf(stdout, "virtio.c: virtio_q_not_vq \n");
+     if (vq->vring.desc) {
+         VirtIODevice *vdev = vq->vdev;
+         trace_virtio_queue_notify(vdev, vq - vdev->vq, vq);
+@@ -723,6 +731,7 @@ void virtio_queue_notify_vq(VirtQueue *vq)
+ 
+ void virtio_queue_notify(VirtIODevice *vdev, int n)
+ {
++    //fprintf(stdout, "qemu: virtio.c: virtio_q_notify \n");
+     virtio_queue_notify_vq(&vdev->vq[n]);
+ }
+ 
+@@ -770,6 +779,7 @@ void virtio_del_queue(VirtIODevice *vdev, int n)
+ void virtio_irq(VirtQueue *vq)
+ {
+     trace_virtio_irq(vq);
++    //fprintf(stdout, "qemu:virtio.c: virtio_irq \n");
+     vq->vdev->isr |= 0x01;
+     virtio_notify_vector(vq->vdev, vq->vector);
+ }
+@@ -812,10 +822,12 @@ static bool vring_notify(VirtIODevice *vdev, VirtQueue *vq)
+ 
+ void virtio_notify(VirtIODevice *vdev, VirtQueue *vq)
+ {
++    //fprintf(stdout, "qemu:virtio.c: virtio_notify \n");
+     if (!vring_notify(vdev, vq)) {
++        //fprintf(stdout, "qemu:virtio.c: vring_notify_error \n");
+         return;
+     }
+-
++    
+     trace_virtio_notify(vdev, vq);
+     vdev->isr |= 0x01;
+     virtio_notify_vector(vdev, vq->vector);
+@@ -1083,6 +1095,7 @@ uint16_t virtio_get_queue_index(VirtQueue *vq)
+ static void virtio_queue_guest_notifier_read(EventNotifier *n)
+ {
+     VirtQueue *vq = container_of(n, VirtQueue, guest_notifier);
++    //fprintf(stdout, "virtio.c: virtio_queue_guest_notifier_read \n");
+     if (event_notifier_test_and_clear(n)) {
+         virtio_irq(vq);
+     }
+@@ -1112,6 +1125,7 @@ EventNotifier *virtio_queue_get_guest_notifier(VirtQueue *vq)
+ static void virtio_queue_host_notifier_read(EventNotifier *n)
+ {
+     VirtQueue *vq = container_of(n, VirtQueue, host_notifier);
++    //fprintf(stdout, "virtio.c virtio_queue_host_notifier_read \n"); 
+     if (event_notifier_test_and_clear(n)) {
+         virtio_queue_notify_vq(vq);
+     }
+@@ -1121,20 +1135,24 @@ void virtio_queue_set_host_notifier_fd_handler(VirtQueue *vq, bool assign,
+                                                bool set_handler)
+ {
+     if (assign && set_handler) {
++        //fprintf(stdout, "virtio.c: set_handler \n");
+         event_notifier_set_handler(&vq->host_notifier,
+                                    virtio_queue_host_notifier_read);
+     } else {
++        //fprintf(stdout, "virtio.c: set_handler NULL \n");
+         event_notifier_set_handler(&vq->host_notifier, NULL);
+     }
+     if (!assign) {
+         /* Test and clear notifier before after disabling event,
+          * in case poll callback didn't have time to run. */
++        //fprintf(stdout, "virtio.c: set_handler read \n");
+         virtio_queue_host_notifier_read(&vq->host_notifier);
+     }
+ }
+ 
+ EventNotifier *virtio_queue_get_host_notifier(VirtQueue *vq)
+ {
++    //fprintf(stdout, "virtio_queue_get_host_notifier \n");
+     return &vq->host_notifier;
+ }
+ 
+diff --git a/util/event_notifier-posix.c b/util/event_notifier-posix.c
+index 8442c6e..cfaa4d3 100644
+--- a/util/event_notifier-posix.c
++++ b/util/event_notifier-posix.c
+@@ -32,6 +32,7 @@ int event_notifier_init(EventNotifier *e, int active)
+ 
+ #ifdef CONFIG_EVENTFD
+     ret = eventfd(0, EFD_NONBLOCK | EFD_CLOEXEC);
++    fprintf(stdout, "qemu: event_init eventfd fd=%d\n", ret);
+ #else
+     ret = -1;
+     errno = ENOSYS;
+@@ -57,6 +58,7 @@ int event_notifier_init(EventNotifier *e, int active)
+         }
+         e->rfd = fds[0];
+         e->wfd = fds[1];
++        fprintf(stdout, "qemu: event_init rfd=%d and wfd=%d\n", e->rfd, e->wfd);
+     }
+     if (active) {
+         event_notifier_set(e);
+@@ -85,6 +87,8 @@ int event_notifier_get_fd(EventNotifier *e)
+ int event_notifier_set_handler(EventNotifier *e,
+                                EventNotifierHandler *handler)
+ {
++    fprintf(stdout, "vhost: event_set_handl for rfd=%d wfd=%d \n",
++            e->rfd, e->wfd);
+     return qemu_set_fd_handler(e->rfd, (IOHandler *)handler, NULL, e);
+ }
+ 

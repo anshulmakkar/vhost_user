@@ -1,0 +1,238 @@
+From 575aacdeff5c69628d015b5c2dda222e100a318c Mon Sep 17 00:00:00 2001
+From: Antonios Motakis <a.motakis@virtualopensystems.com>
+Date: Wed, 8 Jan 2014 09:50:14 +0200
+Subject: [PATCH 3/7] Add vhost-user skeleton
+
+Add empty vhost_call, init and cleanup for the vhost-user backend.
+
+Signed-off-by: Antonios Motakis <a.motakis@virtualopensystems.com>
+Signed-off-by: Nikolay Nikolaev <n.nikolaev@virtualopensystems.com>
+---
+ hw/net/vhost_net.c                | 57 ++++++++++++++++++++++-----------------
+ hw/virtio/vhost-backend.c         | 35 ++++++++++++++++++++++++
+ include/hw/virtio/vhost-backend.h |  3 ++-
+ include/net/vhost_net.h           | 13 ++++++++-
+ net/tap.c                         | 16 ++++++-----
+ 5 files changed, 91 insertions(+), 33 deletions(-)
+
+diff --git a/hw/net/vhost_net.c b/hw/net/vhost_net.c
+index 4aaf0b4..3614e6c 100644
+--- a/hw/net/vhost_net.c
++++ b/hw/net/vhost_net.c
+@@ -91,43 +91,51 @@ static int vhost_net_get_fd(NetClientState *backend)
+     }
+ }
+ 
+-struct vhost_net *vhost_net_init(NetClientState *backend, int devfd,
+-                                 bool force)
++struct vhost_net *vhost_net_init(VhostNetOptions *options)
+ {
+-    int r;
++    int r = -1;
+     struct vhost_net *net = g_malloc(sizeof *net);
+-    if (!backend) {
+-        fprintf(stderr, "vhost-net requires backend to be setup\n");
++
++    if (!options->net_backend) {
++        fprintf(stderr, "vhost-net requires net backend to be setup\n");
+         goto fail;
+     }
+-    r = vhost_net_get_fd(backend);
+-    if (r < 0) {
+-        goto fail;
++
++    if (options->backend_type == VHOST_BACKEND_TYPE_KERNEL) {
++        r = vhost_net_get_fd(options->net_backend);
++        if (r < 0) {
++            goto fail;
++        }
++
++        net->dev.backend_features =
++                tap_has_vnet_hdr(options->net_backend) ? 0 :
++                                (1 << VHOST_NET_F_VIRTIO_NET_HDR);
+     }
+-    net->nc = backend;
+-    net->dev.backend_features = tap_has_vnet_hdr(backend) ? 0 :
+-        (1 << VHOST_NET_F_VIRTIO_NET_HDR);
++
++    net->nc = options->net_backend;
+     net->backend = r;
+ 
+     net->dev.nvqs = 2;
+     net->dev.vqs = net->vqs;
+ 
+-    r = vhost_dev_init(&net->dev, devfd, "/dev/vhost-net",
+-                       VHOST_BACKEND_TYPE_KERNEL, force);
++    r = vhost_dev_init(&net->dev, options->devfd, options->devpath,
++                       options->backend_type, options->force);
+     if (r < 0) {
+         goto fail;
+     }
+-    if (!tap_has_vnet_hdr_len(backend,
+-                              sizeof(struct virtio_net_hdr_mrg_rxbuf))) {
+-        net->dev.features &= ~(1 << VIRTIO_NET_F_MRG_RXBUF);
+-    }
+-    if (~net->dev.features & net->dev.backend_features) {
+-        fprintf(stderr, "vhost lacks feature mask %" PRIu64 " for backend\n",
+-                (uint64_t)(~net->dev.features & net->dev.backend_features));
+-        vhost_dev_cleanup(&net->dev);
+-        goto fail;
++    if (options->backend_type == VHOST_BACKEND_TYPE_KERNEL) {
++        if (!tap_has_vnet_hdr_len(options->net_backend,
++                        sizeof(struct virtio_net_hdr_mrg_rxbuf))) {
++            net->dev.features &= ~(1 << VIRTIO_NET_F_MRG_RXBUF);
++        }
++        if (~net->dev.features & net->dev.backend_features) {
++            fprintf(stderr, "vhost lacks feature mask %" PRIu64
++                   " for backend\n",
++                   (uint64_t)(~net->dev.features & net->dev.backend_features));
++            vhost_dev_cleanup(&net->dev);
++            goto fail;
++        }
+     }
+-
+     /* Set sane init value. Override when guest acks. */
+     vhost_net_ack_features(net, 0);
+     return net;
+@@ -286,8 +294,7 @@ void vhost_net_virtqueue_mask(VHostNetState *net, VirtIODevice *dev,
+     vhost_virtqueue_mask(&net->dev, dev, idx, mask);
+ }
+ #else
+-struct vhost_net *vhost_net_init(NetClientState *backend, int devfd,
+-                                 bool force)
++struct vhost_net *vhost_net_init(VhostNetOptions *options)
+ {
+     error_report("vhost-net support is not compiled in");
+     return NULL;
+diff --git a/hw/virtio/vhost-backend.c b/hw/virtio/vhost-backend.c
+index c0f11e4..1d83e1d 100644
+--- a/hw/virtio/vhost-backend.c
++++ b/hw/virtio/vhost-backend.c
+@@ -16,6 +16,38 @@
+ #include <unistd.h>
+ #include <sys/ioctl.h>
+ 
++static int vhost_user_call(struct vhost_dev *dev, unsigned long int request,
++        void *arg)
++{
++    assert(dev->vhost_ops->backend_type == VHOST_BACKEND_TYPE_USER);
++    error_report("vhost_user_call not implemented\n");
++
++    return -1;
++}
++
++static int vhost_user_init(struct vhost_dev *dev, const char *devpath)
++{
++    assert(dev->vhost_ops->backend_type == VHOST_BACKEND_TYPE_USER);
++    error_report("vhost_user_init not implemented\n");
++
++    return -1;
++}
++
++static int vhost_user_cleanup(struct vhost_dev *dev)
++{
++    assert(dev->vhost_ops->backend_type == VHOST_BACKEND_TYPE_USER);
++    error_report("vhost_user_cleanup not implemented\n");
++
++    return -1;
++}
++
++static const VhostOps user_ops = {
++        .backend_type = VHOST_BACKEND_TYPE_USER,
++        .vhost_call = vhost_user_call,
++        .vhost_backend_init = vhost_user_init,
++        .vhost_backend_cleanup = vhost_user_cleanup
++};
++
+ static int vhost_kernel_call(struct vhost_dev *dev, unsigned long int request,
+                              void *arg)
+ {
+@@ -56,6 +88,9 @@ int vhost_set_backend_type(struct vhost_dev *dev, VhostBackendType backend_type)
+     case VHOST_BACKEND_TYPE_KERNEL:
+         dev->vhost_ops = &kernel_ops;
+         break;
++    case VHOST_BACKEND_TYPE_USER:
++        dev->vhost_ops = &user_ops;
++        break;
+     default:
+         error_report("Unknown vhost backend type\n");
+         r = -1;
+diff --git a/include/hw/virtio/vhost-backend.h b/include/hw/virtio/vhost-backend.h
+index 93fc55b..ef87ffa 100644
+--- a/include/hw/virtio/vhost-backend.h
++++ b/include/hw/virtio/vhost-backend.h
+@@ -14,7 +14,8 @@
+ typedef enum VhostBackendType {
+     VHOST_BACKEND_TYPE_NONE = 0,
+     VHOST_BACKEND_TYPE_KERNEL = 1,
+-    VHOST_BACKEND_TYPE_MAX = 2,
++    VHOST_BACKEND_TYPE_USER = 2,
++    VHOST_BACKEND_TYPE_MAX = 3,
+ } VhostBackendType;
+ 
+ struct vhost_dev;
+diff --git a/include/net/vhost_net.h b/include/net/vhost_net.h
+index 2d936bb..1169562 100644
+--- a/include/net/vhost_net.h
++++ b/include/net/vhost_net.h
+@@ -2,11 +2,22 @@
+ #define VHOST_NET_H
+ 
+ #include "net/net.h"
++#include "hw/virtio/vhost-backend.h"
++
++#define VHOST_NET_DEFAULT_PATH  "/dev/vhost-net"
+ 
+ struct vhost_net;
+ typedef struct vhost_net VHostNetState;
+ 
+-VHostNetState *vhost_net_init(NetClientState *backend, int devfd, bool force);
++typedef struct VhostNetOptions {
++    VhostBackendType backend_type;
++    NetClientState *net_backend;
++    const char *devpath;
++    int devfd;
++    bool force;
++} VhostNetOptions;
++
++struct vhost_net *vhost_net_init(VhostNetOptions *options);
+ 
+ bool vhost_net_query(VHostNetState *net, VirtIODevice *dev);
+ int vhost_net_start(VirtIODevice *dev, NetClientState *ncs, int total_queues);
+diff --git a/net/tap.c b/net/tap.c
+index 39c1cda..776dbc4 100644
+--- a/net/tap.c
++++ b/net/tap.c
+@@ -621,19 +621,23 @@ static int net_init_tap_one(const NetdevTapOptions *tap, NetClientState *peer,
+ 
+     if (tap->has_vhost ? tap->vhost :
+         vhostfdname || (tap->has_vhostforce && tap->vhostforce)) {
+-        int vhostfd;
++        VhostNetOptions options;
++
++        options.backend_type = VHOST_BACKEND_TYPE_KERNEL;
++        options.net_backend = &s->nc;
++        options.devpath = VHOST_NET_DEFAULT_PATH;
++        options.force = tap->has_vhostforce && tap->vhostforce;
+ 
+         if (tap->has_vhostfd || tap->has_vhostfds) {
+-            vhostfd = monitor_handle_fd_param(cur_mon, vhostfdname);
+-            if (vhostfd == -1) {
++            options.devfd = monitor_handle_fd_param(cur_mon, vhostfdname);
++            if (options.devfd == -1) {
+                 return -1;
+             }
+         } else {
+-            vhostfd = -1;
++            options.devfd = -1;
+         }
+ 
+-        s->vhost_net = vhost_net_init(&s->nc, vhostfd,
+-                                      tap->has_vhostforce && tap->vhostforce);
++        s->vhost_net = vhost_net_init(&options);
+         if (!s->vhost_net) {
+             error_report("vhost-net requested but could not be initialized");
+             return -1;
+-- 
+1.9.1
+

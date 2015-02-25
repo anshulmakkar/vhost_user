@@ -1,0 +1,269 @@
+From 08480c33cff7200f48482a592de841826fd28c94 Mon Sep 17 00:00:00 2001
+From: Antonios Motakis <a.motakis@virtualopensystems.com>
+Date: Wed, 8 Jan 2014 09:50:13 +0200
+Subject: [PATCH 1/7] Convert -mem-path to QemuOpts and add prealloc,share and
+ unlink properties
+
+Extend -mem-path with additional properties:
+
+ - prealloc=on|off - default off, same as -mem-prealloc
+ - share=on|off - default off, memory is mmapped with MAP_SHARED flag
+ - unlink=on|off - default on, inlink the file after openinng it
+
+Signed-off-by: Antonios Motakis <a.motakis@virtualopensystems.com>
+Signed-off-by: Nikolay Nikolaev <n.nikolaev@virtualopensystems.com>
+---
+ exec.c                 | 57 +++++++++++++++++++++++++++++++++++++++++---------
+ include/exec/cpu-all.h |  3 ---
+ qemu-options.hx        | 10 +++++++--
+ vl.c                   | 41 +++++++++++++++++++++++++++++++-----
+ 4 files changed, 91 insertions(+), 20 deletions(-)
+
+diff --git a/exec.c b/exec.c
+index 7e49e8e..30f4019 100644
+--- a/exec.c
++++ b/exec.c
+@@ -957,6 +957,7 @@ void qemu_mutex_unlock_ramlist(void)
+ #include <sys/vfs.h>
+ 
+ #define HUGETLBFS_MAGIC       0x958458f6
++#define MIN_HUGE_PAGE_SIZE    (2*1024*1024)
+ 
+ static long gethugepagesize(const char *path)
+ {
+@@ -972,8 +973,9 @@ static long gethugepagesize(const char *path)
+         return 0;
+     }
+ 
+-    if (fs.f_type != HUGETLBFS_MAGIC)
+-        fprintf(stderr, "Warning: path not on HugeTLBFS: %s\n", path);
++    if (fs.f_type != HUGETLBFS_MAGIC) {
++        return 0;
++    }
+ 
+     return fs.f_bsize;
+ }
+@@ -994,11 +996,14 @@ static void *file_ram_alloc(RAMBlock *block,
+     char *c;
+     void *area;
+     int fd;
++    int flags;
+     unsigned long hpagesize;
++    QemuOpts *opts;
++    unsigned int mem_prealloc = 0, mem_share = 0, mem_unlink = 1;
+ 
+     hpagesize = gethugepagesize(path);
+     if (!hpagesize) {
+-        return NULL;
++        hpagesize = MIN_HUGE_PAGE_SIZE;
+     }
+ 
+     if (memory < hpagesize) {
+@@ -1010,6 +1015,14 @@ static void *file_ram_alloc(RAMBlock *block,
+         return NULL;
+     }
+ 
++    /* Fill config options */
++    opts = qemu_opts_find(qemu_find_opts("mem-path"), NULL);
++    if (opts) {
++        mem_prealloc = qemu_opt_get_bool(opts, "prealloc", 0);
++        mem_share = qemu_opt_get_bool(opts, "share", 0);
++        mem_unlink = qemu_opt_get_bool(opts, "unlink", 1);
++    }
++
+     /* Make name safe to use with mkstemp by replacing '/' with '_'. */
+     sanitized_name = g_strdup(block->mr->name);
+     for (c = sanitized_name; *c != '\0'; c++) {
+@@ -1017,20 +1030,28 @@ static void *file_ram_alloc(RAMBlock *block,
+             *c = '_';
+     }
+ 
+-    filename = g_strdup_printf("%s/qemu_back_mem.%s.XXXXXX", path,
+-                               sanitized_name);
++    filename = g_strdup_printf("%s/qemu_back_mem.%s%s", path, sanitized_name,
++                               (mem_unlink) ? ".XXXXXX" : "");
+     g_free(sanitized_name);
+ 
+-    fd = mkstemp(filename);
++    if (mem_unlink) {
++        fd = mkstemp(filename);
++    } else {
++        fd = open(filename, O_CREAT | O_RDWR | O_EXCL,
++                S_IRWXU | S_IRWXG | S_IRWXO);
++    }
+     if (fd < 0) {
+-        perror("unable to create backing store for hugepages");
++        perror("unable to create guest RAM backing store");
+         g_free(filename);
+         return NULL;
+     }
+-    unlink(filename);
++
++    if (mem_unlink) {
++        unlink(filename);
++    }
+     g_free(filename);
+ 
+-    memory = (memory+hpagesize-1) & ~(hpagesize-1);
++    memory = (memory + hpagesize - 1) & ~(hpagesize - 1);
+ 
+     /*
+      * ftruncate is not supported by hugetlbfs in older
+@@ -1041,7 +1062,8 @@ static void *file_ram_alloc(RAMBlock *block,
+     if (ftruncate(fd, memory))
+         perror("ftruncate");
+ 
+-    area = mmap(0, memory, PROT_READ | PROT_WRITE, MAP_PRIVATE, fd, 0);
++    flags = mem_share ? MAP_SHARED : MAP_PRIVATE;
++    area = mmap(0, memory, PROT_READ | PROT_WRITE, flags, fd, 0);
+     if (area == MAP_FAILED) {
+         perror("file_ram_alloc: can't mmap RAM pages");
+         close(fd);
+@@ -1211,11 +1233,18 @@ ram_addr_t qemu_ram_alloc_from_ptr(ram_addr_t size, void *host,
+                                    MemoryRegion *mr)
+ {
+     RAMBlock *block, *new_block;
++    QemuOpts *opts;
++    const char *mem_path = 0;
+ 
+     size = TARGET_PAGE_ALIGN(size);
+     new_block = g_malloc0(sizeof(*new_block));
+     new_block->fd = -1;
+ 
++    opts = qemu_opts_find(qemu_find_opts("mem-path"), NULL);
++    if (opts) {
++        mem_path = qemu_opt_get(opts, "path");
++    }
++
+     /* This assumes the iothread lock is taken here too.  */
+     qemu_mutex_lock_ramlist();
+     new_block->mr = mr;
+@@ -1348,6 +1377,14 @@ void qemu_ram_remap(ram_addr_t addr, ram_addr_t length)
+     ram_addr_t offset;
+     int flags;
+     void *area, *vaddr;
++    QemuOpts *opts;
++    unsigned int mem_prealloc = 0;
++
++    /* Fill config options */
++    opts = qemu_opts_find(qemu_find_opts("mem-path"), NULL);
++    if (opts) {
++        mem_prealloc = qemu_opt_get_bool(opts, "prealloc", 0);
++    }
+ 
+     QTAILQ_FOREACH(block, &ram_list.blocks, next) {
+         offset = addr - block->offset;
+diff --git a/include/exec/cpu-all.h b/include/exec/cpu-all.h
+index b6998f0..4f8e989 100644
+--- a/include/exec/cpu-all.h
++++ b/include/exec/cpu-all.h
+@@ -467,9 +467,6 @@ typedef struct RAMList {
+ } RAMList;
+ extern RAMList ram_list;
+ 
+-extern const char *mem_path;
+-extern int mem_prealloc;
+-
+ /* Flags stored in the low bits of the TLB virtual address.  These are
+    defined so that fast path ram access is all zeros.  */
+ /* Zero if TLB entry is valid.  */
+diff --git a/qemu-options.hx b/qemu-options.hx
+index bcfe9ea..0d35c9c 100644
+--- a/qemu-options.hx
++++ b/qemu-options.hx
+@@ -221,9 +221,15 @@ gigabytes respectively.
+ ETEXI
+ 
+ DEF("mem-path", HAS_ARG, QEMU_OPTION_mempath,
+-    "-mem-path FILE  provide backing storage for guest RAM\n", QEMU_ARCH_ALL)
++    "-mem-path [path=]path[,prealloc=on|off][,share=on|off][,unlink=on|off]\n"
++    "                provide backing storage for guest RAM\n"
++    "                path= a directory path for the backing store\n"
++    "                prealloc= preallocate guest memory [default disabled]\n"
++    "                share= enable mmap share flag [default disabled]\n"
++    "                unlink= enable unlinking the guest RAM files [default enabled]\n",
++        QEMU_ARCH_ALL)
+ STEXI
+-@item -mem-path @var{path}
++@item -mem-path [path=]@var{path}[,prealloc=on|off][,share=on|off][,unlink=on|off]
+ @findex -mem-path
+ Allocate guest RAM from a temporarily created file in @var{path}.
+ ETEXI
+diff --git a/vl.c b/vl.c
+index 7511e70..4a52e0d 100644
+--- a/vl.c
++++ b/vl.c
+@@ -187,8 +187,6 @@ DisplayType display_type = DT_DEFAULT;
+ static int display_remote;
+ const char* keyboard_layout = NULL;
+ ram_addr_t ram_size;
+-const char *mem_path = NULL;
+-int mem_prealloc = 0; /* force preallocation of physical target memory */
+ int nb_nics;
+ NICInfo nd_table[MAX_NICS];
+ int autostart;
+@@ -531,6 +529,31 @@ static QemuOptsList qemu_msg_opts = {
+     },
+ };
+ 
++static QemuOptsList qemu_mem_path_opts = {
++    .name = "mem-path",
++    .implied_opt_name = "path",
++    .head = QTAILQ_HEAD_INITIALIZER(qemu_mem_path_opts.head),
++    .desc = {
++        {
++            .name = "path",
++            .type = QEMU_OPT_STRING,
++        },
++        {
++            .name = "prealloc",
++            .type = QEMU_OPT_BOOL,
++        },
++        {
++            .name = "share",
++            .type = QEMU_OPT_BOOL,
++        },
++        {
++            .name = "unlink",
++            .type = QEMU_OPT_BOOL,
++        },
++        { /* end of list */ }
++    },
++};
++
+ /**
+  * Get machine options
+  *
+@@ -2892,6 +2915,7 @@ int main(int argc, char **argv, char **envp)
+     qemu_add_opts(&qemu_tpmdev_opts);
+     qemu_add_opts(&qemu_realtime_opts);
+     qemu_add_opts(&qemu_msg_opts);
++    qemu_add_opts(&qemu_mem_path_opts);
+ 
+     runstate_init();
+ 
+@@ -3209,11 +3233,18 @@ int main(int argc, char **argv, char **envp)
+                 break;
+ #endif
+             case QEMU_OPTION_mempath:
+-                mem_path = optarg;
++                if (!qemu_opts_parse(qemu_find_opts("mem-path"), optarg, 1)) {
++                    exit(1);
++                }
+                 break;
+-            case QEMU_OPTION_mem_prealloc:
+-                mem_prealloc = 1;
++            case QEMU_OPTION_mem_prealloc: {
++                QemuOpts *mem_opts = qemu_opts_find(qemu_find_opts("mem-path"),
++                                                    NULL);
++                if (mem_opts) {
++                    qemu_opt_set(mem_opts, "prealloc", "on");
++                }
+                 break;
++            }
+             case QEMU_OPTION_d:
+                 log_mask = optarg;
+                 break;
+-- 
+1.9.1
+
